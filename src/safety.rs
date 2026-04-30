@@ -1,8 +1,11 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::config::ToolPermissionMode;
 use crate::notifications::NotificationDispatcher;
 use crate::storage;
 
@@ -59,6 +62,16 @@ pub struct Decision {
     pub decided_via: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPermissionRequirement {
+    pub reason: String,
+    pub fingerprint: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +134,164 @@ const AUTO_ALLOWED: &[&str] = &[
     "codesearch",
 ];
 
+const ASK_MODE_REQUIRES: &[&str] = &[
+    "bash",
+    "write",
+    "edit",
+    "multiedit",
+    "patch",
+    "apply_patch",
+    "browser",
+    "gmail",
+    "mcp",
+    "open",
+    "webfetch",
+    "websearch",
+    "codesearch",
+    "subagent",
+    "swarm",
+    "schedule",
+    "selfdev",
+    "debug_socket",
+];
+
+pub fn tool_permission_requirement(
+    mode: ToolPermissionMode,
+    tool_name: &str,
+    input: &Value,
+    working_dir: Option<&Path>,
+) -> Option<ToolPermissionRequirement> {
+    let name = canonical_tool_name(tool_name);
+    let reason = match mode {
+        ToolPermissionMode::Ask => ask_mode_reason(&name, input, working_dir),
+        ToolPermissionMode::Autopilot => None,
+    }?;
+
+    Some(ToolPermissionRequirement {
+        reason,
+        fingerprint: tool_permission_fingerprint(&name, input),
+    })
+}
+
+pub fn tool_permission_fingerprint(tool_name: &str, input: &Value) -> String {
+    format!("{}:{}", canonical_tool_name(tool_name), input)
+}
+
+fn canonical_tool_name(tool_name: &str) -> String {
+    let lower = tool_name.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "communicate" => "swarm".to_string(),
+        "task" | "task_runner" => "subagent".to_string(),
+        "launch" => "open".to_string(),
+        "shell_exec" => "bash".to_string(),
+        "file_read" => "read".to_string(),
+        "file_write" => "write".to_string(),
+        "file_edit" => "edit".to_string(),
+        "file_glob" => "glob".to_string(),
+        "file_grep" => "grep".to_string(),
+        "todoread" | "todowrite" | "todo_read" | "todo_write" => "todo".to_string(),
+        other if other.starts_with("mcp__") => "mcp".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn ask_mode_reason(name: &str, input: &Value, working_dir: Option<&Path>) -> Option<String> {
+    if name == "batch" || name == "invalid" || name == "todo" || name == "bg" {
+        return None;
+    }
+    if name == "memory" {
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(action.as_str(), "remember" | "forget" | "tag" | "link") {
+            return Some("memory mutation requires approval in ask mode".to_string());
+        }
+        return None;
+    }
+    if name == "read" && input_references_sensitive_path(input, working_dir) {
+        return Some("reading a sensitive file requires approval in ask mode".to_string());
+    }
+    if matches!(name, "grep" | "glob" | "agentgrep")
+        && input_references_sensitive_path(input, working_dir)
+    {
+        return Some("searching a sensitive path requires approval in ask mode".to_string());
+    }
+    if ASK_MODE_REQUIRES.iter().any(|tool| tool == &name) {
+        return Some(format!("tool '{}' requires approval in ask mode", name));
+    }
+    None
+}
+
+fn input_references_sensitive_path(input: &Value, working_dir: Option<&Path>) -> bool {
+    let keys = ["file_path", "path", "target", "glob"];
+    keys.iter().any(|key| {
+        input
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(|value| path_looks_sensitive(value, working_dir))
+            .unwrap_or(false)
+    })
+}
+
+fn path_looks_sensitive(path: &str, working_dir: Option<&Path>) -> bool {
+    let path = path.trim();
+    if path.is_empty() {
+        return false;
+    }
+    let expanded = expand_path(path, working_dir);
+    let lower = expanded.to_string_lossy().to_ascii_lowercase();
+    let file_name = expanded
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+
+    if lower.contains("/.jcode/auth")
+        || lower.contains("/.jcode/servers.json")
+        || lower.contains("/.claude.json")
+        || lower.contains("/.claude/")
+        || lower.contains("/.ssh/")
+        || lower.contains("/.aws/")
+        || lower.contains("/.kube/")
+    {
+        return true;
+    }
+
+    file_name == ".env"
+        || file_name.ends_with(".pem")
+        || file_name.ends_with(".key")
+        || file_name.contains("secret")
+        || file_name.contains("token")
+        || file_name.contains("credential")
+        || file_name == "id_rsa"
+        || file_name == "id_ed25519"
+}
+
+fn expand_path(path: &str, working_dir: Option<&Path>) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    let path_buf = PathBuf::from(path);
+    if path_buf.is_absolute() {
+        path_buf
+    } else if let Some(working_dir) = working_dir {
+        working_dir.join(path_buf)
+    } else {
+        path_buf
+    }
+}
+
+fn permission_fingerprint(context: Option<&Value>) -> Option<&str> {
+    context?
+        .get("tool_permission")?
+        .get("fingerprint")?
+        .as_str()
+}
+
 // ---------------------------------------------------------------------------
 // SafetySystem
 // ---------------------------------------------------------------------------
@@ -161,6 +332,28 @@ impl SafetySystem {
         } else {
             ActionTier::RequiresPermission
         }
+    }
+
+    pub fn pending_tool_permission_request(&self, fingerprint: &str) -> Option<PermissionRequest> {
+        self.queue.lock().ok().and_then(|q| {
+            q.iter()
+                .find(|request| {
+                    permission_fingerprint(request.context.as_ref()) == Some(fingerprint)
+                })
+                .cloned()
+        })
+    }
+
+    pub fn has_recent_tool_permission_approval(&self, fingerprint: &str) -> bool {
+        const APPROVAL_TTL_SECS: i64 = 10 * 60;
+        let cutoff = Utc::now() - chrono::Duration::seconds(APPROVAL_TTL_SECS);
+        self.history.lock().is_ok_and(|history| {
+            history.iter().rev().any(|decision| {
+                decision.approved
+                    && decision.decided_at >= cutoff
+                    && permission_fingerprint(decision.context.as_ref()) == Some(fingerprint)
+            })
+        })
     }
 
     /// Submit a permission request. Returns `Queued` with the request id.
@@ -211,6 +404,8 @@ impl SafetySystem {
                         "Expired automatically: {}. Original agent is no longer active.",
                         reason
                     )),
+                    action: None,
+                    context: None,
                 });
             }
             let _ = persist_history(&h);
@@ -227,6 +422,12 @@ impl SafetySystem {
         via: &str,
         message: Option<String>,
     ) -> Result<()> {
+        let matched_request = self
+            .queue
+            .lock()
+            .ok()
+            .and_then(|q| q.iter().find(|r| r.id == request_id).cloned());
+
         // Remove from queue
         if let Ok(mut q) = self.queue.lock() {
             q.retain(|r| r.id != request_id);
@@ -239,6 +440,10 @@ impl SafetySystem {
             decided_at: Utc::now(),
             decided_via: via.to_string(),
             message,
+            action: matched_request
+                .as_ref()
+                .map(|request| request.action.clone()),
+            context: matched_request.and_then(|request| request.context),
         };
 
         if let Ok(mut h) = self.history.lock() {
@@ -371,6 +576,7 @@ pub fn record_permission_via_file(
     } else {
         Vec::new()
     };
+    let matched_request = queue.iter().find(|r| r.id == request_id).cloned();
     queue.retain(|r| r.id != request_id);
     persist_queue(&queue)?;
 
@@ -389,6 +595,10 @@ pub fn record_permission_via_file(
         decided_at: Utc::now(),
         decided_via: via.to_string(),
         message,
+        action: matched_request
+            .as_ref()
+            .map(|request| request.action.clone()),
+        context: matched_request.and_then(|request| request.context),
     });
     persist_history(&history)?;
 
@@ -442,6 +652,8 @@ pub fn expire_stale_permissions_via_file(via: &str) -> Result<Vec<String>> {
                 "Expired automatically: {}. Original agent is no longer active.",
                 reason
             )),
+            action: None,
+            context: None,
         });
     }
     persist_history(&history)?;
@@ -697,6 +909,100 @@ mod tests {
                 !still_pending,
                 "request should have been removed from queue"
             );
+        });
+    }
+
+    #[test]
+    fn test_tool_permission_ask_mode_requires_shell_and_sensitive_read() {
+        with_temp_home(|| {
+            let shell = tool_permission_requirement(
+                ToolPermissionMode::Ask,
+                "bash",
+                &serde_json::json!({"command": "echo ok"}),
+                None,
+            );
+            assert!(shell.is_some());
+
+            let normal_read = tool_permission_requirement(
+                ToolPermissionMode::Ask,
+                "read",
+                &serde_json::json!({"file_path": "src/main.rs"}),
+                Some(Path::new("/tmp/project")),
+            );
+            assert!(normal_read.is_none());
+
+            let sensitive_read = tool_permission_requirement(
+                ToolPermissionMode::Ask,
+                "read",
+                &serde_json::json!({"file_path": "~/.claude.json"}),
+                None,
+            );
+            assert!(sensitive_read.is_some());
+        });
+    }
+
+    #[test]
+    fn test_tool_permission_autopilot_allows_all_tool_calls() {
+        with_temp_home(|| {
+            let cases = [
+                (
+                    "bash",
+                    serde_json::json!({"command": "rm -rf /tmp/example"}),
+                ),
+                (
+                    "gmail",
+                    serde_json::json!({"action": "send", "to": "x@example.com"}),
+                ),
+                (
+                    "mcp",
+                    serde_json::json!({"action": "connect", "server": "test"}),
+                ),
+                (
+                    "browser",
+                    serde_json::json!({"action": "click", "selector": "button"}),
+                ),
+                ("read", serde_json::json!({"file_path": "~/.claude.json"})),
+            ];
+
+            for (tool, input) in cases {
+                let requirement =
+                    tool_permission_requirement(ToolPermissionMode::Autopilot, tool, &input, None);
+                assert!(
+                    requirement.is_none(),
+                    "{tool} should not require permission in autopilot mode"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_tool_permission_approval_is_matched_by_fingerprint() {
+        with_temp_home(|| {
+            let sys = SafetySystem::new();
+            let input = serde_json::json!({"command": "echo ok"});
+            let fingerprint = tool_permission_fingerprint("bash", &input);
+            let req = PermissionRequest {
+                id: "req_tool_test".to_string(),
+                action: "tool:bash".to_string(),
+                description: "Run tool 'bash'".to_string(),
+                rationale: "test".to_string(),
+                urgency: Urgency::Normal,
+                wait: true,
+                created_at: Utc::now(),
+                context: Some(serde_json::json!({
+                    "tool_permission": {
+                        "fingerprint": fingerprint,
+                    }
+                })),
+            };
+            sys.request_permission(req);
+            assert!(sys.pending_tool_permission_request(&fingerprint).is_some());
+
+            sys.record_decision("req_tool_test", true, "test", None)
+                .unwrap();
+
+            assert!(sys.pending_tool_permission_request(&fingerprint).is_none());
+            assert!(sys.has_recent_tool_permission_approval(&fingerprint));
         });
     }
 }

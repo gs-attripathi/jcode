@@ -151,6 +151,31 @@ pub struct Config {
     pub autojudge: AutoJudgeConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolPermissionMode {
+    #[default]
+    Ask,
+    Autopilot,
+}
+
+impl ToolPermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Autopilot => "autopilot",
+        }
+    }
+
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "ask" | "strict" | "confirm" | "confirmation" => Some(Self::Ask),
+            "autopilot" | "auto" | "yolo" | "bypass" => Some(Self::Autopilot),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum NamedProviderType {
@@ -739,6 +764,8 @@ impl Default for AmbientConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SafetyConfig {
+    /// Runtime tool permission mode: ask (default) or autopilot
+    pub tool_permission_mode: ToolPermissionMode,
     /// ntfy.sh topic name (required for push notifications)
     pub ntfy_topic: Option<String>,
     /// ntfy.sh server URL (default: https://ntfy.sh)
@@ -786,6 +813,7 @@ pub struct SafetyConfig {
 impl Default for SafetyConfig {
     fn default() -> Self {
         Self {
+            tool_permission_mode: ToolPermissionMode::Ask,
             ntfy_topic: None,
             ntfy_server: "https://ntfy.sh".to_string(),
             desktop_notifications: true,

@@ -501,6 +501,8 @@ impl Registry {
         // Drop the lock before executing
         drop(tools);
 
+        self.ensure_tool_permission(resolved_name, &input, &ctx)?;
+
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -513,6 +515,69 @@ impl Registry {
         output = self.guard_context_overflow(name, output).await;
 
         Ok(output)
+    }
+
+    fn ensure_tool_permission(&self, name: &str, input: &Value, ctx: &ToolContext) -> Result<()> {
+        let cfg = crate::config::Config::load();
+        let mode = cfg.safety.tool_permission_mode;
+        let Some(requirement) = crate::safety::tool_permission_requirement(
+            mode,
+            name,
+            input,
+            ctx.working_dir.as_deref(),
+        ) else {
+            return Ok(());
+        };
+
+        let safety = crate::safety::SafetySystem::new();
+        if safety.has_recent_tool_permission_approval(&requirement.fingerprint) {
+            return Ok(());
+        }
+
+        if let Some(pending) = safety.pending_tool_permission_request(&requirement.fingerprint) {
+            anyhow::bail!(
+                "Permission required for tool '{}': {}. Pending request id: {}. Run `jcode permissions` to approve or deny, then retry the tool call.",
+                name,
+                requirement.reason,
+                pending.id
+            );
+        }
+
+        let request_id = crate::safety::new_request_id();
+        let description = format!("Run tool '{}'", name);
+        let request = crate::safety::PermissionRequest {
+            id: request_id.clone(),
+            action: format!("tool:{}", name),
+            description: description.clone(),
+            rationale: requirement.reason.clone(),
+            urgency: crate::safety::Urgency::Normal,
+            wait: true,
+            created_at: chrono::Utc::now(),
+            context: Some(serde_json::json!({
+                "session_id": ctx.session_id.clone(),
+                "message_id": ctx.message_id.clone(),
+                "tool_call_id": ctx.tool_call_id.clone(),
+                "working_dir": ctx.working_dir.as_ref().map(|p| p.display().to_string()),
+                "tool_permission": {
+                    "mode": mode.as_str(),
+                    "tool": name,
+                    "input": input,
+                    "fingerprint": requirement.fingerprint.clone(),
+                    "reason": requirement.reason.clone(),
+                },
+                "review": {
+                    "summary": description,
+                    "why_permission_needed": requirement.reason.clone(),
+                }
+            })),
+        };
+        safety.request_permission(request);
+        anyhow::bail!(
+            "Permission required for tool '{}': {}. Queued request id: {}. Run `jcode permissions` to approve or deny, then retry the tool call.",
+            name,
+            requirement.reason,
+            request_id
+        )
     }
 
     /// Check if a tool output would overflow the context window and truncate if needed.

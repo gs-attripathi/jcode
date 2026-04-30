@@ -16,6 +16,12 @@ pub(crate) enum GoogleAccessTierArg {
     Readonly,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum PermissionModeArg {
+    Ask,
+    Autopilot,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "jcode")]
 #[command(version = env!("JCODE_VERSION"))]
@@ -221,8 +227,16 @@ pub(crate) enum Command {
         revoke: Option<String>,
     },
 
-    /// Review and respond to pending ambient permission requests
-    Permissions,
+    /// Review and respond to pending permission requests
+    Permissions {
+        /// Set the runtime tool permission mode
+        #[arg(long, value_enum)]
+        mode: Option<PermissionModeArg>,
+
+        /// Print the current runtime tool permission mode
+        #[arg(long)]
+        status: bool,
+    },
 
     /// Inject externally transcribed text into the active Jcode TUI
     Transcript {

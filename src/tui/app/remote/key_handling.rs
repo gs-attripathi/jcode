@@ -1506,6 +1506,80 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if trimmed == "/rewind" {
+                    remote.rewind(0).await?;
+                    return Ok(());
+                }
+
+                if trimmed == "/mcp" || trimmed == "/mcp list" {
+                    remote.mcp_control("list", None).await?;
+                    return Ok(());
+                }
+
+                if trimmed == "/mcp reload" {
+                    app.push_display_message(DisplayMessage::system(
+                        "Reloading MCP servers from config…".to_string(),
+                    ));
+                    remote.mcp_control("reload", None).await?;
+                    return Ok(());
+                }
+
+                if let Some(rest) = trimmed.strip_prefix("/mcp connect ") {
+                    let name = rest.trim();
+                    if name.is_empty() {
+                        app.push_display_message(DisplayMessage::error(
+                            "Usage: `/mcp connect <name>` (name must match an entry in `~/.jcode/mcp.json`)".to_string(),
+                        ));
+                    } else {
+                        app.push_display_message(DisplayMessage::system(format!(
+                            "Connecting MCP server `{name}`…"
+                        )));
+                        remote.mcp_control("connect", Some(name)).await?;
+                    }
+                    return Ok(());
+                }
+
+                if let Some(rest) = trimmed.strip_prefix("/mcp disconnect ") {
+                    let name = rest.trim();
+                    if name.is_empty() {
+                        app.push_display_message(DisplayMessage::error(
+                            "Usage: `/mcp disconnect <name>`".to_string(),
+                        ));
+                    } else {
+                        app.push_display_message(DisplayMessage::system(format!(
+                            "Disconnecting MCP server `{name}`…"
+                        )));
+                        remote.mcp_control("disconnect", Some(name)).await?;
+                    }
+                    return Ok(());
+                }
+
+                if trimmed.starts_with("/mcp ") || trimmed == "/mcp" {
+                    app.push_display_message(DisplayMessage::error(
+                        "Usage: `/mcp [list|reload|connect <name>|disconnect <name>]`".to_string(),
+                    ));
+                    return Ok(());
+                }
+
+                if let Some(num_str) = trimmed.strip_prefix("/rewind ") {
+                    let num_str = num_str.trim();
+                    match num_str.parse::<usize>() {
+                        Ok(n) if n > 0 => {
+                            app.push_display_message(DisplayMessage::system(format!(
+                                "Rewinding to message {n}…"
+                            )));
+                            remote.rewind(n).await?;
+                        }
+                        Ok(_) | Err(_) => {
+                            app.push_display_message(DisplayMessage::error(
+                                "Usage: `/rewind N` where N is a positive message number. Run `/rewind` to see the list."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
+
                 if trimmed == "/compact mode" || trimmed == "/compact mode status" {
                     let mode = app
                         .remote_compaction_mode

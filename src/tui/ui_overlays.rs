@@ -144,6 +144,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Set connection transport (auto|https|websocket)",
     ));
     lines.push(help_entry(
+        "/mode [ask|autopilot]",
+        "Show or persist tool permission mode",
+    ));
+    lines.push(help_entry(
         "/alignment [status|centered|left]",
         "Show or persist text alignment preference",
     ));

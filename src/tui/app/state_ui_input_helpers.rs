@@ -64,6 +64,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/effort", "Show/change reasoning effort (Alt+left/right)"),
     RegisteredCommand::public("/fast", "Toggle OpenAI/Codex fast mode"),
     RegisteredCommand::public("/transport", "Show/change connection transport"),
+    RegisteredCommand::public("/mode", "Show/change tool permission mode"),
     RegisteredCommand::public("/alignment", "Show/change default text alignment"),
     RegisteredCommand::public("/clear", "Clear conversation history"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
@@ -852,6 +853,20 @@ impl App {
             );
         }
 
+        if prefix.starts_with("/mode ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    ("/mode status".into(), "Show current permission mode"),
+                    ("/mode ask".into(), "Ask before protected tool actions"),
+                    (
+                        "/mode autopilot".into(),
+                        "Allow every tool call without prompting",
+                    ),
+                ],
+            );
+        }
+
         if prefix.starts_with("/config ") {
             return self.rank_suggestions(
                 input,
@@ -1087,6 +1102,7 @@ impl App {
                 | "/effort"
                 | "/fast"
                 | "/transport"
+                | "/mode"
                 | "/login"
                 | "/auth"
                 | "/account"

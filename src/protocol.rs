@@ -104,6 +104,19 @@ pub enum Request {
     #[serde(rename = "clear")]
     Clear { id: u64 },
 
+    /// Rewind conversation to message index `n` (1-based), dropping everything after.
+    #[serde(rename = "rewind")]
+    Rewind { id: u64, n: usize },
+
+    /// Manage MCP servers: list, reload, connect, disconnect.
+    #[serde(rename = "mcp_control")]
+    McpControl {
+        id: u64,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+    },
+
     /// Health check
     #[serde(rename = "ping")]
     Ping { id: u64 },
@@ -1115,6 +1128,29 @@ pub enum ServerEvent {
         success: bool,
     },
 
+    /// Response to an MCP control request.
+    #[serde(rename = "mcp_result")]
+    McpResult {
+        id: u64,
+        output: String,
+        success: bool,
+    },
+
+    /// Response to rewind request. When `truncated` is true the conversation was rewound
+    /// to message `kept` and the client should replace its display with `messages`. When
+    /// `truncated` is false the request was a read-only listing (n=0) and `messages`
+    /// reflects the unchanged server history.
+    #[serde(rename = "rewound")]
+    Rewound {
+        id: u64,
+        session_id: String,
+        messages: Vec<HistoryMessage>,
+        kept: usize,
+        removed: usize,
+        #[serde(default)]
+        truncated: bool,
+    },
+
     /// A running command is waiting for stdin input from the user
     #[serde(rename = "stdin_request")]
     StdinRequest {
@@ -1285,6 +1321,8 @@ impl Request {
             Request::SoftInterrupt { id, .. } => *id,
             Request::CancelSoftInterrupts { id } => *id,
             Request::Clear { id } => *id,
+            Request::Rewind { id, .. } => *id,
+            Request::McpControl { id, .. } => *id,
             Request::Ping { id } => *id,
             Request::GetState { id } => *id,
             Request::DebugCommand { id, .. } => *id,

@@ -43,6 +43,49 @@ fn test_rewind_truncates_provider_messages() {
 }
 
 #[test]
+fn test_rewind_lists_provider_messages_when_session_messages_empty() {
+    let mut app = create_test_app();
+
+    app.replace_provider_messages(vec![
+        Message::user("provider-only user"),
+        Message::assistant_text("provider-only assistant"),
+    ]);
+
+    app.input = "/rewind".to_string();
+    app.submit_input();
+
+    let latest = app.display_messages().last().expect("rewind output");
+    assert!(latest.content.contains("Conversation history"));
+    assert!(latest.content.contains("provider-only user"));
+    assert!(latest.content.contains("provider-only assistant"));
+    assert!(!latest.content.contains("No messages in conversation"));
+}
+
+#[test]
+fn test_rewind_truncates_provider_messages_when_session_messages_empty() {
+    let mut app = create_test_app();
+
+    app.replace_provider_messages(vec![
+        Message::user("provider-only-1"),
+        Message::assistant_text("provider-only-2"),
+        Message::user("provider-only-3"),
+    ]);
+    app.provider_session_id = Some("provider-session".to_string());
+    app.session.provider_session_id = Some("provider-session".to_string());
+
+    app.input = "/rewind 2".to_string();
+    app.submit_input();
+
+    assert_eq!(app.messages.len(), 2);
+    assert!(matches!(
+        &app.messages[1].content[0],
+        ContentBlock::Text { text, .. } if text == "provider-only-2"
+    ));
+    assert!(app.provider_session_id.is_none());
+    assert!(app.session.provider_session_id.is_none());
+}
+
+#[test]
 fn test_accumulate_streaming_output_tokens_uses_deltas() {
     let mut app = create_test_app();
     let mut seen = 0;

@@ -5,8 +5,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Instant;
 
 use super::args::{
-    AmbientCommand, Args, AuthCommand, Command, MemoryCommand, ModelCommand, ProviderCommand,
-    RestartCommand, TranscriptModeArg,
+    AmbientCommand, Args, AuthCommand, Command, MemoryCommand, ModelCommand, PermissionModeArg,
+    ProviderCommand, RestartCommand, TranscriptModeArg,
 };
 use crate::{
     agent, auth, build, provider, provider_catalog, server, session, setup_hints, startup_profile,
@@ -156,8 +156,25 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         Some(Command::Pair { list, revoke }) => {
             commands::run_pair_command(list, revoke)?;
         }
-        Some(Command::Permissions) => {
-            tui::permissions::run_permissions()?;
+        Some(Command::Permissions { mode, status }) => {
+            if let Some(mode) = mode {
+                let mode = match mode {
+                    PermissionModeArg::Ask => crate::config::ToolPermissionMode::Ask,
+                    PermissionModeArg::Autopilot => crate::config::ToolPermissionMode::Autopilot,
+                };
+                crate::config::Config::set_tool_permission_mode(mode)?;
+                println!("Tool permission mode set to {}.", mode.as_str());
+            }
+            if status || mode.is_some() {
+                let cfg = crate::config::Config::load();
+                println!(
+                    "Current tool permission mode: {}",
+                    cfg.safety.tool_permission_mode.as_str()
+                );
+            }
+            if mode.is_none() && !status {
+                tui::permissions::run_permissions()?;
+            }
         }
         Some(Command::Transcript {
             text,

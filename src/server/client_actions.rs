@@ -840,6 +840,233 @@ pub(super) fn handle_compact(
     });
 }
 
+pub(super) fn handle_rewind(
+    id: u64,
+    n: usize,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let agent = Arc::clone(agent);
+    let tx = client_event_tx.clone();
+    tokio::spawn(async move {
+        let (event, log_msg) = {
+            let mut agent_guard = agent.lock().await;
+            let session_id = agent_guard.session_id().to_string();
+            let total_prompts = agent_guard.user_prompt_count();
+
+            // n == 0 is a read-only listing request. n > total_prompts is invalid.
+            if n > total_prompts {
+                let _ = tx.send(ServerEvent::Error {
+                    id,
+                    message: format!(
+                        "Invalid rewind index {n}: session has {total_prompts} prompt{}.",
+                        if total_prompts == 1 { "" } else { "s" }
+                    ),
+                    retry_after_secs: None,
+                });
+                let _ = tx.send(ServerEvent::Done { id });
+                return;
+            }
+
+            let (kept, removed, truncated) = if n == 0 {
+                (total_prompts, 0, false)
+            } else {
+                match agent_guard.rewind_to_prompt(n) {
+                    Some((kept, removed)) => (kept, removed, true),
+                    None => {
+                        let _ = tx.send(ServerEvent::Error {
+                            id,
+                            message: format!(
+                                "Invalid rewind index {n}: session has {total_prompts} prompt{}.",
+                                if total_prompts == 1 { "" } else { "s" }
+                            ),
+                            retry_after_secs: None,
+                        });
+                        let _ = tx.send(ServerEvent::Done { id });
+                        return;
+                    }
+                }
+            };
+            let (history, _images) = agent_guard.get_history_and_rendered_images();
+            (
+                ServerEvent::Rewound {
+                    id,
+                    session_id,
+                    messages: history,
+                    kept,
+                    removed,
+                    truncated,
+                },
+                format!(
+                    "handle_rewind: n={n} kept_prompts={kept} removed_msgs={removed} truncated={truncated}"
+                ),
+            )
+        };
+        crate::logging::info(&log_msg);
+        let _ = tx.send(event);
+        let _ = tx.send(ServerEvent::Done { id });
+    });
+}
+
+pub(super) fn handle_mcp_control(
+    id: u64,
+    action: String,
+    server: Option<String>,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let agent = Arc::clone(agent);
+    let tx = client_event_tx.clone();
+    tokio::spawn(async move {
+        let result = match action.as_str() {
+            "list" => mcp_list_output(&agent).await,
+            "reload" => {
+                let mut agent_guard = agent.lock().await;
+                let res = agent_guard
+                    .execute_tool("mcp", serde_json::json!({"action": "reload"}))
+                    .await;
+                if res.is_ok() {
+                    agent_guard.unlock_tools();
+                }
+                res.map(|out| out.output)
+                    .map_err(|e| format!("MCP reload failed: {e}"))
+            }
+            "connect" => match server.as_deref() {
+                Some(name) => mcp_connect_named(&agent, name).await,
+                None => Err("`/mcp connect <name>` requires a server name.".to_string()),
+            },
+            "disconnect" => match server.as_deref() {
+                Some(name) => {
+                    let agent_guard = agent.lock().await;
+                    agent_guard
+                        .execute_tool(
+                            "mcp",
+                            serde_json::json!({"action": "disconnect", "server": name}),
+                        )
+                        .await
+                        .map(|out| out.output)
+                        .map_err(|e| format!("MCP disconnect failed: {e}"))
+                }
+                None => Err("`/mcp disconnect <name>` requires a server name.".to_string()),
+            },
+            other => Err(format!(
+                "Unknown /mcp action `{other}`. Try: list, reload, connect <name>, disconnect <name>."
+            )),
+        };
+
+        let event = match result {
+            Ok(output) => ServerEvent::McpResult {
+                id,
+                output,
+                success: true,
+            },
+            Err(message) => ServerEvent::McpResult {
+                id,
+                output: message,
+                success: false,
+            },
+        };
+        let _ = tx.send(event);
+        let _ = tx.send(ServerEvent::Done { id });
+    });
+}
+
+async fn mcp_list_output(agent: &Arc<Mutex<Agent>>) -> Result<String, String> {
+    use std::collections::BTreeMap;
+
+    let config = crate::mcp::McpConfig::load();
+    let config_path = crate::storage::jcode_dir()
+        .ok()
+        .map(|d| d.join("mcp.json"))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string());
+
+    let agent_guard = agent.lock().await;
+    let tool_names = agent_guard.tool_names().await;
+    drop(agent_guard);
+
+    let mut connected_tools: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for name in &tool_names {
+        if let Some(rest) = name.strip_prefix("mcp__")
+            && let Some((server, tool)) = rest.split_once("__")
+        {
+            connected_tools
+                .entry(server.to_string())
+                .or_default()
+                .push(tool.to_string());
+        }
+    }
+    for tools in connected_tools.values_mut() {
+        tools.sort();
+    }
+    let connected: std::collections::BTreeSet<String> =
+        connected_tools.keys().cloned().collect();
+    let configured: std::collections::BTreeSet<String> = config.servers.keys().cloned().collect();
+    let all: std::collections::BTreeSet<String> =
+        connected.union(&configured).cloned().collect();
+
+    let mut output = String::from("**MCP servers**\n\n");
+    if let Some(path) = config_path {
+        output.push_str(&format!("Config: `{path}`\n\n"));
+    } else {
+        output.push_str("Config: _(no `mcp.json` found in `~/.jcode/`)_\n\n");
+    }
+
+    if all.is_empty() {
+        output.push_str(
+            "_No servers configured or connected. Add entries to `~/.jcode/mcp.json` and run `/mcp reload`._\n",
+        );
+    } else {
+        for name in &all {
+            let is_connected = connected.contains(name);
+            let is_configured = configured.contains(name);
+            let status = match (is_connected, is_configured) {
+                (true, true) => "✓ connected",
+                (true, false) => "✓ connected (ad-hoc)",
+                (false, true) => "○ not connected",
+                (false, false) => "?",
+            };
+            output.push_str(&format!("• **{name}** — {status}\n"));
+            if let Some(tools) = connected_tools.get(name) {
+                if tools.is_empty() {
+                    output.push_str("    _(no tools)_\n");
+                } else {
+                    output.push_str(&format!("    tools ({}): {}\n", tools.len(), tools.join(", ")));
+                }
+            }
+        }
+        output.push_str(
+            "\nUse `/mcp reload` to re-read the config, `/mcp connect <name>` / `/mcp disconnect <name>` to toggle a server.\n",
+        );
+    }
+    Ok(output)
+}
+
+async fn mcp_connect_named(agent: &Arc<Mutex<Agent>>, name: &str) -> Result<String, String> {
+    let config = crate::mcp::McpConfig::load();
+    let server_cfg = config
+        .servers
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("Server `{name}` not found in `~/.jcode/mcp.json`."))?;
+    let mut input = serde_json::json!({
+        "action": "connect",
+        "server": name,
+        "command": server_cfg.command,
+        "args": server_cfg.args,
+    });
+    if !server_cfg.env.is_empty() {
+        input["env"] = serde_json::to_value(&server_cfg.env).unwrap_or(serde_json::Value::Null);
+    }
+    let mut agent_guard = agent.lock().await;
+    let res = agent_guard.execute_tool("mcp", input).await;
+    if res.is_ok() {
+        agent_guard.unlock_tools();
+    }
+    res.map(|out| out.output)
+        .map_err(|e| format!("MCP connect failed: {e}"))
+}
+
 pub(super) async fn handle_stdin_response(
     id: u64,
     request_id: String,

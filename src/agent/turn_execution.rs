@@ -1,5 +1,14 @@
 use super::*;
 
+fn is_user_prompt(msg: &StoredMessage) -> bool {
+    matches!(msg.role, Role::User)
+        && msg.display_role.is_none()
+        && msg
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { .. }))
+}
+
 impl Agent {
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
@@ -148,6 +157,58 @@ impl Agent {
         self.provider_session_id = None;
         self.session.provider_session_id = None;
         self.persist_session_best_effort("provider session reset");
+    }
+
+    /// Number of user prompts in the session (matches the on-screen prompt counter).
+    /// A "user prompt" is a `Role::User` stored message that contains at least one
+    /// `Text` content block — this excludes user-role tool-result messages.
+    pub fn user_prompt_count(&self) -> usize {
+        self.session
+            .messages
+            .iter()
+            .filter(|m| is_user_prompt(m))
+            .count()
+    }
+
+    /// Rewind the conversation so that the first `prompt_n` user prompts (and the
+    /// assistant turns that completed each) are kept, dropping everything from the
+    /// `(prompt_n + 1)`-th user prompt onward. Returns (kept_prompts, removed_messages).
+    /// Returns `None` if `prompt_n` is greater than the current user-prompt count.
+    pub fn rewind_to_prompt(&mut self, prompt_n: usize) -> Option<(usize, usize)> {
+        if prompt_n == 0 {
+            return None;
+        }
+        let total_messages = self.session.messages.len();
+        let mut seen = 0usize;
+        let mut truncate_at = total_messages;
+        for (i, msg) in self.session.messages.iter().enumerate() {
+            if is_user_prompt(msg) {
+                seen += 1;
+                if seen == prompt_n + 1 {
+                    truncate_at = i;
+                    break;
+                }
+            }
+        }
+        let total_prompts = if seen == prompt_n + 1 {
+            // We bailed out early; recount the rest only if needed for validation.
+            // Since we found a (prompt_n+1)-th prompt, total_prompts >= prompt_n + 1.
+            prompt_n + 1
+        } else {
+            seen
+        };
+        if prompt_n > total_prompts {
+            return None;
+        }
+        let removed = total_messages - truncate_at;
+        if removed == 0 {
+            return Some((prompt_n, 0));
+        }
+        self.session.truncate_messages(truncate_at);
+        self.provider_session_id = None;
+        self.session.provider_session_id = None;
+        self.persist_session_best_effort("rewind");
+        Some((prompt_n, removed))
     }
 
     /// Unlock the tool list so the next API request picks up any new tools.

@@ -1208,6 +1208,68 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             false
         }
+        ServerEvent::McpResult {
+            output, success, ..
+        } => {
+            if success {
+                app.push_display_message(DisplayMessage::system(output));
+            } else {
+                app.push_display_message(DisplayMessage::error(output));
+            }
+            false
+        }
+        ServerEvent::Rewound {
+            messages,
+            kept,
+            removed,
+            truncated,
+            ..
+        } => {
+            if truncated {
+                let restored = messages
+                    .into_iter()
+                    .map(|msg| DisplayMessage {
+                        role: msg.role,
+                        content: msg.content,
+                        tool_calls: msg.tool_calls.unwrap_or_default(),
+                        duration_secs: None,
+                        title: None,
+                        tool_data: msg.tool_data,
+                    })
+                    .collect();
+                app.replace_display_messages(restored);
+                app.provider_session_id = None;
+                app.session.provider_session_id = None;
+                app.push_display_message(DisplayMessage::system(format!(
+                    "✓ Rewound to prompt {kept}. Removed {removed} message{}.",
+                    if removed == 1 { "" } else { "s" }
+                )));
+                app.set_status_notice(format!("Rewound to prompt {kept}"));
+                app.follow_chat_bottom();
+            } else {
+                let prompts: Vec<&crate::protocol::HistoryMessage> = messages
+                    .iter()
+                    .filter(|m| m.role == "user")
+                    .collect();
+                if prompts.is_empty() {
+                    app.push_display_message(DisplayMessage::system(
+                        "No prompts in conversation.".to_string(),
+                    ));
+                } else {
+                    let mut listing = String::from("**Your prompts:**\n\n");
+                    for (i, msg) in prompts.iter().enumerate() {
+                        let flattened = msg.content.trim().replace('\n', " ");
+                        let preview = crate::util::truncate_str(flattened.as_str(), 80);
+                        listing.push_str(&format!("  `{}` - {}\n", i + 1, preview));
+                    }
+                    listing.push_str(
+                        "\nUse `/rewind N` to keep prompts 1..N and drop everything after the assistant's reply to prompt N.",
+                    );
+                    app.push_display_message(DisplayMessage::system(listing));
+                }
+            }
+            false
+        }
         ServerEvent::StdinRequest { .. } => {
             app.set_status_notice("⌨ Interactive terminal detected (command will timeout)");
             false

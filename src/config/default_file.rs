@@ -203,6 +203,11 @@ port = 7643
 bind_addr = "0.0.0.0"
 
 [safety]
+# Runtime tool permission mode: "ask" (default) or "autopilot".
+# ask: queue approval before risky tools such as shell, edits, network/browser/Gmail/MCP, and sensitive file reads.
+# autopilot: permission gate allows all tool calls without prompting.
+tool_permission_mode = "ask"
+
 # Notification settings for ambient mode events
 
 # ntfy.sh push notifications (free, phone app: https://ntfy.sh)

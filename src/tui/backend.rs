@@ -679,6 +679,28 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Ask the server to rewind the conversation to message `n` (1-based).
+    pub async fn rewind(&mut self, n: usize) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::Rewind { id, n };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Send an MCP control action (list / reload / connect / disconnect).
+    pub async fn mcp_control(&mut self, action: &str, server: Option<&str>) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::McpControl {
+            id,
+            action: action.to_string(),
+            server: server.map(|s| s.to_string()),
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Trigger immediate memory extraction on the server for the active session.
     pub async fn trigger_memory_extraction(&mut self) -> Result<()> {
         let id = self.next_request_id;

@@ -67,6 +67,37 @@ pub(super) fn is_poke_message(message: &str) -> bool {
         && message.ends_with("update the todo tool.")
 }
 
+fn message_content_preview(message: &Message) -> String {
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text, .. } => {
+                let text = text.trim();
+                if !text.is_empty() {
+                    return text.replace('\n', " ");
+                }
+            }
+            ContentBlock::ToolUse { name, .. } => {
+                return format!("[tool: {}]", name);
+            }
+            ContentBlock::ToolResult { content, .. } => {
+                let preview = content.trim().replace('\n', " ");
+                if !preview.is_empty() {
+                    return format!("[result: {}]", preview);
+                }
+            }
+            _ => {}
+        }
+    }
+    "(empty)".to_string()
+}
+
+fn message_role_label(role: &Role) -> &'static str {
+    match role {
+        Role::User => "👤 User",
+        Role::Assistant => "🤖 Assistant",
+    }
+}
+
 pub(super) fn queued_messages_are_only_pokes(messages: &[String]) -> bool {
     !messages.is_empty() && messages.iter().all(|message| is_poke_message(message))
 }
@@ -1191,7 +1222,15 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/rewind" {
-        if app.session.messages.is_empty() {
+        let provider_messages;
+        let use_provider_messages = app.session.messages.is_empty();
+        if use_provider_messages {
+            provider_messages = app.materialized_provider_messages();
+        } else {
+            provider_messages = Vec::new();
+        }
+
+        if app.session.messages.is_empty() && provider_messages.is_empty() {
             app.push_display_message(DisplayMessage::system(
                 "No messages in conversation.".to_string(),
             ));
@@ -1199,14 +1238,20 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         }
 
         let mut history = String::from("**Conversation history:**\n\n");
-        for (i, msg) in app.session.messages.iter().enumerate() {
-            let role_str = match msg.role {
-                Role::User => "👤 User",
-                Role::Assistant => "🤖 Assistant",
-            };
-            let content = msg.content_preview();
-            let preview = crate::util::truncate_str(&content, 80);
-            history.push_str(&format!("  `{}` {} - {}\n", i + 1, role_str, preview));
+        if use_provider_messages {
+            for (i, msg) in provider_messages.iter().enumerate() {
+                let role_str = message_role_label(&msg.role);
+                let content = message_content_preview(msg);
+                let preview = crate::util::truncate_str(&content, 80);
+                history.push_str(&format!("  `{}` {} - {}\n", i + 1, role_str, preview));
+            }
+        } else {
+            for (i, msg) in app.session.messages.iter().enumerate() {
+                let role_str = message_role_label(&msg.role);
+                let content = msg.content_preview();
+                let preview = crate::util::truncate_str(&content, 80);
+                history.push_str(&format!("  `{}` {} - {}\n", i + 1, role_str, preview));
+            }
         }
         history.push_str("\nUse `/rewind N` to rewind to message N (removes all messages after).");
 
@@ -1216,6 +1261,17 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
 
     if let Some(num_str) = trimmed.strip_prefix("/rewind ") {
         let num_str = num_str.trim();
+        let provider_messages = if app.session.messages.is_empty() {
+            app.materialized_provider_messages()
+        } else {
+            Vec::new()
+        };
+        let valid_len = if app.session.messages.is_empty() {
+            provider_messages.len()
+        } else {
+            app.session.messages.len()
+        };
+
         match num_str.parse::<usize>() {
             Ok(n) if n > 0 && n <= app.session.messages.len() => {
                 let removed = app.session.messages.len() - n;
@@ -1247,17 +1303,33 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
                     if removed == 1 { "" } else { "s" }
                 )));
             }
+            Ok(n) if app.session.messages.is_empty() && n > 0 && n <= provider_messages.len() => {
+                let removed = provider_messages.len() - n;
+                let rewound_messages = provider_messages[..n].to_vec();
+                app.replace_provider_messages(rewound_messages);
+                app.session.updated_at = chrono::Utc::now();
+
+                app.provider_session_id = None;
+                app.session.provider_session_id = None;
+                let _ = app.session.save();
+
+                app.push_display_message(DisplayMessage::system(format!(
+                    "✓ Rewound to message {}. Removed {} message{}.",
+                    n,
+                    removed,
+                    if removed == 1 { "" } else { "s" }
+                )));
+            }
             Ok(n) => {
                 app.push_display_message(DisplayMessage::error(format!(
                     "Invalid message number: {}. Valid range: 1-{}",
-                    n,
-                    app.session.messages.len()
+                    n, valid_len
                 )));
             }
             Err(_) => {
                 app.push_display_message(DisplayMessage::error(format!(
                     "Usage: `/rewind N` where N is a message number (1-{})",
-                    app.session.messages.len()
+                    valid_len
                 )));
             }
         }
@@ -1645,7 +1717,55 @@ fn handle_alignment_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+fn permission_mode_label(mode: crate::config::ToolPermissionMode) -> &'static str {
+    mode.as_str()
+}
+
+fn handle_permission_mode_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/mode" && !trimmed.starts_with("/mode ") {
+        return false;
+    }
+
+    let rest = trimmed.strip_prefix("/mode").unwrap_or_default().trim();
+
+    if rest.is_empty() || matches!(rest, "status" | "show") {
+        let mode = crate::config::Config::load().safety.tool_permission_mode;
+        app.push_display_message(DisplayMessage::system(format!(
+            "Permission mode: **{}**\n\nUse `/mode ask` to require approvals, or `/mode autopilot` to allow every tool call without prompting.",
+            permission_mode_label(mode)
+        )));
+        return true;
+    }
+
+    let Some(mode) = crate::config::ToolPermissionMode::parse(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: `/mode`, `/mode ask`, or `/mode autopilot`".to_string(),
+        ));
+        return true;
+    };
+
+    match crate::config::Config::set_tool_permission_mode(mode) {
+        Ok(()) => {
+            app.set_status_notice(format!("Permission mode: {}", permission_mode_label(mode)));
+            app.push_display_message(DisplayMessage::system(format!(
+                "Saved permission mode: **{}**.",
+                permission_mode_label(mode)
+            )));
+        }
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Failed to save permission mode: {}",
+            error
+        ))),
+    }
+
+    true
+}
+
 pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
+    if handle_permission_mode_command(app, trimmed) {
+        return true;
+    }
+
     if handle_alignment_command(app, trimmed) {
         return true;
     }

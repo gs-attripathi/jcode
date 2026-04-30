@@ -112,6 +112,59 @@ fn test_alignment_invalid_usage_shows_error() {
 }
 
 #[test]
+fn test_mode_command_persists_autopilot() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        app.input = "/mode autopilot".to_string();
+
+        app.submit_input();
+
+        let cfg = crate::config::Config::load();
+        assert_eq!(
+            cfg.safety.tool_permission_mode,
+            crate::config::ToolPermissionMode::Autopilot
+        );
+        assert_eq!(
+            app.status_notice(),
+            Some("Permission mode: autopilot".to_string())
+        );
+        let last = app.display_messages().last().expect("missing response");
+        assert_eq!(last.role, "system");
+        assert!(last.content.contains("Saved permission mode: **autopilot**"));
+    });
+}
+
+#[test]
+fn test_mode_status_shows_current_mode() {
+    with_temp_jcode_home(|| {
+        crate::config::Config::set_tool_permission_mode(crate::config::ToolPermissionMode::Ask)
+            .expect("save permission mode");
+
+        let mut app = create_test_app();
+        app.input = "/mode".to_string();
+
+        app.submit_input();
+
+        let last = app.display_messages().last().expect("missing response");
+        assert_eq!(last.role, "system");
+        assert!(last.content.contains("Permission mode: **ask**"));
+        assert!(last.content.contains("/mode autopilot"));
+    });
+}
+
+#[test]
+fn test_mode_invalid_usage_shows_error() {
+    let mut app = create_test_app();
+    app.input = "/mode maybe".to_string();
+
+    app.submit_input();
+
+    let last = app.display_messages().last().expect("missing response");
+    assert_eq!(last.role, "error");
+    assert!(last.content.contains("Usage: `/mode`"));
+}
+
+#[test]
 fn test_help_topic_shows_fix_command_details() {
     let mut app = create_test_app();
     app.input = "/help fix".to_string();

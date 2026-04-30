@@ -89,6 +89,17 @@ impl Config {
         Self::set_default_model(cfg.provider.default_model.as_deref(), provider)
     }
 
+    pub fn set_tool_permission_mode(mode: ToolPermissionMode) -> anyhow::Result<()> {
+        let mut cfg = Self::load();
+        cfg.safety.tool_permission_mode = mode;
+        cfg.save()?;
+        crate::logging::info(&format!(
+            "Saved safety.tool_permission_mode to config: {}",
+            mode.as_str()
+        ));
+        Ok(())
+    }
+
     /// Update just the default model in the config file.
     pub fn set_default_model_only(model: Option<&str>) -> anyhow::Result<()> {
         let cfg = Self::load();
