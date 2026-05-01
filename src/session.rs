@@ -166,6 +166,12 @@ pub struct StoredMessage {
     pub tool_duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<StoredTokenUsage>,
+    /// Tree linkage: id of this message's parent in the conversation tree.
+    /// `None` means root (first message of the session). Set on append from
+    /// the session's `active_leaf_id`. Legacy sessions saved before chat-tree
+    /// support load with this `None` and are interpreted linearly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -429,6 +435,13 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<StoredMessage>,
+    /// Tip of the active branch: the message id of the leaf currently being
+    /// extended/displayed. The "active path" is the chain of messages reached
+    /// by walking `parent_id` back from this leaf to the root.
+    /// `None` for empty sessions and legacy sessions before chat-tree support;
+    /// such sessions are interpreted linearly (active path == messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_leaf_id: Option<String>,
     /// Persisted compacted-view state so reload/resume can continue using the
     /// active summary + recent tail instead of re-sending the full transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1151,6 +1164,14 @@ impl Session {
         }
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
+        // Backfill chat-tree state for sessions saved before tree support: if
+        // there is no recorded active leaf but messages exist, treat the flat
+        // sequence as a single branch and pick the last message as the leaf.
+        if session.active_leaf_id.is_none()
+            && let Some(last) = session.messages.last()
+        {
+            session.active_leaf_id = Some(last.id.clone());
+        }
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
@@ -1188,6 +1209,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            active_leaf_id: None,
             compaction: None,
             provider_session_id: None,
             provider_key: None,
@@ -1234,6 +1256,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            active_leaf_id: None,
             compaction: None,
             provider_session_id: None,
             provider_key: None,
@@ -1466,6 +1489,14 @@ impl Session {
         }
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
+        // Backfill chat-tree state for sessions saved before tree support: if
+        // there is no recorded active leaf but messages exist, treat the flat
+        // sequence as a single branch and pick the last message as the leaf.
+        if session.active_leaf_id.is_none()
+            && let Some(last) = session.messages.last()
+        {
+            session.active_leaf_id = Some(last.id.clone());
+        }
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
@@ -1738,11 +1769,18 @@ impl Session {
             timestamp: Some(Utc::now()),
             tool_duration_ms,
             token_usage,
+            parent_id: None,
         });
         id
     }
 
-    pub fn append_stored_message(&mut self, message: StoredMessage) {
+    pub fn append_stored_message(&mut self, mut message: StoredMessage) {
+        // Tree linkage: every appended message extends the active branch.
+        // If the caller didn't set parent_id, fill it from the current leaf.
+        if message.parent_id.is_none() {
+            message.parent_id = self.active_leaf_id.clone();
+        }
+        self.active_leaf_id = Some(message.id.clone());
         self.memory_profile_cache.messages_count += 1;
         self.memory_profile_cache.messages_json_bytes += estimate_json_bytes(&message);
         self.memory_profile_cache
@@ -1750,6 +1788,78 @@ impl Session {
             .merge_from(&summarize_blocks(&message.content));
         self.messages.push(message);
         self.mark_messages_append_dirty();
+    }
+
+    /// Move the active branch tip to `leaf_id`. Caller must ensure the id
+    /// belongs to a message in this session. Invalidates the provider message
+    /// cache because the path may have changed shape (different branch).
+    pub fn set_active_leaf(&mut self, leaf_id: String) {
+        if self.active_leaf_id.as_deref() == Some(leaf_id.as_str()) {
+            return;
+        }
+        self.active_leaf_id = Some(leaf_id);
+        self.mark_messages_full_dirty();
+    }
+
+    /// All messages that no other message claims as a parent — i.e. the
+    /// branch tips. For a single-branch session this returns just the last
+    /// message. For trees, one entry per branch.
+    pub fn leaves(&self) -> Vec<&StoredMessage> {
+        let parent_ids: std::collections::HashSet<&str> = self
+            .messages
+            .iter()
+            .filter_map(|m| m.parent_id.as_deref())
+            .collect();
+        self.messages
+            .iter()
+            .filter(|m| !parent_ids.contains(m.id.as_str()))
+            .collect()
+    }
+
+    /// Look up a message by a short id suffix (the last 4–8 chars of its
+    /// full id). Returns `Some` only if exactly one message matches the
+    /// prefix; ambiguous matches return `None` so the caller can ask for
+    /// disambiguation.
+    pub fn find_message_by_short_id(&self, short: &str) -> Option<&StoredMessage> {
+        let short = short.trim_start_matches('@');
+        let mut hits = self.messages.iter().filter(|m| m.id.ends_with(short));
+        let first = hits.next()?;
+        if hits.next().is_some() {
+            return None; // ambiguous
+        }
+        Some(first)
+    }
+
+    /// 4-char short id rendered for compact display (e.g. tree panel).
+    pub fn short_id(message_id: &str) -> String {
+        let take = message_id.len().saturating_sub(4);
+        message_id[take..].to_string()
+    }
+
+    /// The chain of messages from root to `active_leaf_id`, in chronological
+    /// order. For legacy sessions without `active_leaf_id`, falls back to the
+    /// flat insertion order so single-branch sessions are unaffected.
+    pub fn active_path(&self) -> Vec<&StoredMessage> {
+        let Some(leaf_id) = self.active_leaf_id.as_deref() else {
+            return self.messages.iter().collect();
+        };
+        let by_id: std::collections::HashMap<&str, &StoredMessage> = self
+            .messages
+            .iter()
+            .map(|m| (m.id.as_str(), m))
+            .collect();
+        let mut chain: Vec<&StoredMessage> = Vec::new();
+        let mut cur = by_id.get(leaf_id).copied();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(node) = cur {
+            if !seen.insert(node.id.as_str()) {
+                break; // defensive: cycle guard
+            }
+            chain.push(node);
+            cur = node.parent_id.as_deref().and_then(|p| by_id.get(p).copied());
+        }
+        chain.reverse();
+        chain
     }
 
     pub fn insert_message(&mut self, index: usize, message: StoredMessage) {
@@ -1769,6 +1879,9 @@ impl Session {
             self.messages.truncate(len);
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
+            // Re-anchor the active leaf to whatever survived the truncation
+            // so `active_path()` doesn't dangle on a deleted id.
+            self.active_leaf_id = self.messages.last().map(|m| m.id.clone());
         }
     }
 
@@ -1876,36 +1989,44 @@ impl Session {
     }
 
     pub fn provider_messages(&mut self) -> &[Message] {
+        // Build the LLM-bound message list from the *active branch* of the
+        // conversation tree, not from the flat insertion order. For sessions
+        // that never branch, active_path == messages so nothing changes.
+        let path_messages: Vec<Message> = self
+            .active_path()
+            .iter()
+            .map(|m| m.to_message())
+            .collect();
+        let path_len = path_messages.len();
+
         let needs_full_rebuild = self.provider_messages_cache_mode == PersistVectorMode::Full
-            || self.provider_messages_cache_len > self.messages.len();
+            || self.provider_messages_cache_len > path_len;
 
         if needs_full_rebuild {
             self.provider_messages_cache.clear();
             self.provider_message_prefix_hashes_cache.clear();
-            self.provider_messages_cache.reserve(self.messages.len());
-            self.provider_message_prefix_hashes_cache
-                .reserve(self.messages.len());
-            for index in 0..self.messages.len() {
-                let message = self.messages[index].to_message();
+            self.provider_messages_cache.reserve(path_len);
+            self.provider_message_prefix_hashes_cache.reserve(path_len);
+            for message in path_messages {
                 self.push_provider_message_cache_entry(message);
             }
-            self.provider_messages_cache_len = self.messages.len();
+            self.provider_messages_cache_len = path_len;
             self.provider_messages_cache_mode = PersistVectorMode::Clean;
             return &self.provider_messages_cache;
         }
 
         if self.provider_messages_cache_mode == PersistVectorMode::Append
-            && self.provider_messages_cache_len < self.messages.len()
+            && self.provider_messages_cache_len < path_len
         {
-            let appended_len = self.messages.len() - self.provider_messages_cache_len;
+            let cached_len = self.provider_messages_cache_len;
+            let appended_len = path_len - cached_len;
             self.provider_messages_cache.reserve(appended_len);
             self.provider_message_prefix_hashes_cache
                 .reserve(appended_len);
-            for index in self.provider_messages_cache_len..self.messages.len() {
-                let message = self.messages[index].to_message();
+            for message in path_messages.into_iter().skip(cached_len) {
                 self.push_provider_message_cache_entry(message);
             }
-            self.provider_messages_cache_len = self.messages.len();
+            self.provider_messages_cache_len = path_len;
             self.provider_messages_cache_mode = PersistVectorMode::Clean;
         }
 
@@ -1918,7 +2039,9 @@ impl Session {
     }
 
     pub fn messages_for_provider_uncached(&self) -> Vec<Message> {
-        stored_messages_to_messages(&self.messages)
+        // Active branch only — same semantics as `provider_messages`, but
+        // bypasses the cache for callers that don't want a mutable borrow.
+        self.active_path().iter().map(|m| m.to_message()).collect()
     }
 
     pub fn messages_for_provider(&mut self) -> Vec<Message> {

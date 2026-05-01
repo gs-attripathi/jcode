@@ -898,6 +898,7 @@ pub fn import_session_from_file(path: &Path, session_id: &str) -> Result<Session
                 timestamp: None,
                 tool_duration_ms: None,
                 token_usage: None,
+                parent_id: None,
             });
         }
     }
@@ -1069,6 +1070,7 @@ fn append_text_message(
         timestamp,
         tool_duration_ms: None,
         token_usage: None,
+        parent_id: None,
     });
 }
 

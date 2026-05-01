@@ -108,6 +108,12 @@ pub enum Request {
     #[serde(rename = "rewind")]
     Rewind { id: u64, n: usize },
 
+    /// Switch the active branch tip to a different leaf in the conversation
+    /// tree. `target` is a short id suffix (the last few chars of a message id);
+    /// the server resolves it against its leaves.
+    #[serde(rename = "checkout")]
+    Checkout { id: u64, target: String },
+
     /// Manage MCP servers: list, reload, connect, disconnect.
     #[serde(rename = "mcp_control")]
     McpControl {
@@ -1322,6 +1328,7 @@ impl Request {
             Request::CancelSoftInterrupts { id } => *id,
             Request::Clear { id } => *id,
             Request::Rewind { id, .. } => *id,
+            Request::Checkout { id, .. } => *id,
             Request::McpControl { id, .. } => *id,
             Request::Ping { id } => *id,
             Request::GetState { id } => *id,

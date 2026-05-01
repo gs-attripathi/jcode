@@ -908,6 +908,81 @@ pub(super) fn handle_rewind(
     });
 }
 
+pub(super) fn handle_checkout(
+    id: u64,
+    target: String,
+    agent: &Arc<Mutex<Agent>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let agent = Arc::clone(agent);
+    let tx = client_event_tx.clone();
+    tokio::spawn(async move {
+        let (event, log_msg) = {
+            let mut agent_guard = agent.lock().await;
+            let session_id = agent_guard.session_id().to_string();
+
+            let resolved_id = match agent_guard
+                .session_ref()
+                .find_message_by_short_id(&target)
+                .map(|m| m.id.clone())
+            {
+                Some(id) => id,
+                None => {
+                    let _ = tx.send(ServerEvent::Error {
+                        id,
+                        message: format!(
+                            "No unique branch matches `{}`. Run /branches to list leaves.",
+                            target
+                        ),
+                        retry_after_secs: None,
+                    });
+                    let _ = tx.send(ServerEvent::Done { id });
+                    return;
+                }
+            };
+
+            // Only allow checkout to leaves (branch tips).
+            let leaf_ids: std::collections::HashSet<String> = agent_guard
+                .session_ref()
+                .leaves()
+                .iter()
+                .map(|m| m.id.clone())
+                .collect();
+            if !leaf_ids.contains(&resolved_id) {
+                let _ = tx.send(ServerEvent::Error {
+                    id,
+                    message: "Target is not a branch tip — /checkout currently only accepts leaf ids."
+                        .to_string(),
+                    retry_after_secs: None,
+                });
+                let _ = tx.send(ServerEvent::Done { id });
+                return;
+            }
+
+            agent_guard.checkout_active_leaf(resolved_id.clone());
+            let kept = agent_guard.user_prompt_count();
+            let (history, _images) = agent_guard.get_history_and_rendered_images();
+            (
+                ServerEvent::Rewound {
+                    id,
+                    session_id,
+                    messages: history,
+                    kept,
+                    removed: 0,
+                    truncated: true,
+                },
+                format!(
+                    "handle_checkout: target={} resolved={} kept_prompts={}",
+                    target, resolved_id, kept
+                ),
+            )
+        };
+        crate::logging::info(&log_msg);
+        let _ = tx.send(event);
+        let _ = tx.send(ServerEvent::Done { id });
+    });
+}
+
 pub(super) fn handle_mcp_control(
     id: u64,
     action: String,

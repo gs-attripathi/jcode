@@ -870,7 +870,10 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
 
         let mut info = String::new();
         info.push_str(&format!("**Version:** {}\n", version));
-        info.push_str(&format!("**Session:** {}\n", app.session.id));
+        let session_id_for_info = app
+            .active_client_session_id()
+            .unwrap_or(app.session.id.as_str());
+        info.push_str(&format!("**Session:** {}\n", session_id_for_info));
         info.push_str(&format!(
             "**Duration:** {} ({} turns)\n",
             duration_str, turn_count

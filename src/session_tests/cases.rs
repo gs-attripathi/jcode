@@ -117,6 +117,7 @@ fn load_startup_stub_preserves_metadata_but_skips_heavy_vectors() -> Result<()> 
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
         token_usage: None,
+        parent_id: None,
     });
     session.record_env_snapshot(EnvSnapshot {
         captured_at: Utc::now(),
@@ -188,6 +189,7 @@ fn load_for_remote_startup_preserves_messages_and_replay_but_skips_heavy_vectors
         timestamp: Some(Utc::now()),
         tool_duration_ms: None,
         token_usage: None,
+        parent_id: None,
     });
     session.record_env_snapshot(EnvSnapshot {
         captured_at: Utc::now(),
@@ -840,4 +842,107 @@ fn test_render_messages_and_images_share_tool_resolution_and_labels() {
             tool_name: "view_image".to_string(),
         }
     );
+}
+
+#[test]
+fn append_sets_parent_id_and_advances_active_leaf() {
+    let mut session = Session::create(None, None);
+    assert!(session.active_leaf_id.is_none(), "fresh session has no leaf");
+
+    let id1 = session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "first".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.active_leaf_id.as_deref(), Some(id1.as_str()));
+    assert_eq!(session.messages[0].parent_id, None, "root has no parent");
+
+    let id2 = session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "reply".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert_eq!(session.active_leaf_id.as_deref(), Some(id2.as_str()));
+    assert_eq!(session.messages[1].parent_id.as_deref(), Some(id1.as_str()));
+
+    let path = session.active_path();
+    assert_eq!(path.len(), 2);
+    assert_eq!(path[0].id, id1);
+    assert_eq!(path[1].id, id2);
+}
+
+#[test]
+fn active_path_walks_only_the_active_branch_when_siblings_exist() {
+    // Hand-build a tree:  root → A → B  (active leaf)
+    //                          ↘ C
+    // Walking from B should ignore C entirely.
+    let mut session = Session::create(None, None);
+    let root_id = session.add_message(Role::User, vec![ContentBlock::Text { text: "root".into(), cache_control: None }]);
+    let a_id = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "A".into(), cache_control: None }]);
+    let b_id = session.add_message(Role::User, vec![ContentBlock::Text { text: "B".into(), cache_control: None }]);
+
+    // Inject sibling C of A by appending with an explicit parent_id of root.
+    session.append_stored_message(StoredMessage {
+        id: "manual_c".into(),
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text { text: "C".into(), cache_control: None }],
+        display_role: None,
+        timestamp: None,
+        tool_duration_ms: None,
+        token_usage: None,
+        parent_id: Some(root_id.clone()),
+    });
+    // Appending C also moves the leaf; restore it to B for this test.
+    session.active_leaf_id = Some(b_id.clone());
+
+    let path: Vec<&str> = session.active_path().iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(path, vec![root_id.as_str(), a_id.as_str(), b_id.as_str()]);
+    assert_eq!(session.messages.len(), 4, "C is still stored, just off-path");
+}
+
+#[test]
+fn rewind_via_active_leaf_preserves_storage_so_branch_can_resurface() {
+    // Build: u1 -> a1 -> u2 -> a2 -> u3 -> a3 (active leaf = a3)
+    // Rewind to keep first 1 user prompt should leave leaf = a1 and
+    // messages still len() == 6 (no destruction).
+    let mut session = Session::create(None, None);
+    let _u1 = session.add_message(Role::User, vec![ContentBlock::Text { text: "u1".into(), cache_control: None }]);
+    let a1 = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "a1".into(), cache_control: None }]);
+    let _u2 = session.add_message(Role::User, vec![ContentBlock::Text { text: "u2".into(), cache_control: None }]);
+    let _a2 = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "a2".into(), cache_control: None }]);
+    let _u3 = session.add_message(Role::User, vec![ContentBlock::Text { text: "u3".into(), cache_control: None }]);
+    let _a3 = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "a3".into(), cache_control: None }]);
+
+    // Find user_indices manually (we don't expose Agent here in unit tests),
+    // and emulate what `Agent::rewind_to_prompt(1)` does at the session layer.
+    let path: Vec<&StoredMessage> = session.active_path();
+    let user_indices: Vec<usize> = path
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| match (&m.role, m.content.iter().any(|b| matches!(b, ContentBlock::Text { .. }))) {
+            (Role::User, true) if m.display_role.is_none() => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_indices.len(), 3);
+    let drop_at = user_indices[1]; // (prompt_n=1) -> drop everything from 2nd user prompt onward
+    let new_leaf = path[drop_at - 1].id.clone();
+    drop(path);
+
+    session.set_active_leaf(new_leaf.clone());
+    assert_eq!(session.active_leaf_id.as_deref(), Some(new_leaf.as_str()));
+    assert_eq!(session.active_leaf_id.as_deref(), Some(a1.as_str()));
+    assert_eq!(session.messages.len(), 6, "storage is non-destructive");
+    assert_eq!(session.active_path().len(), 2, "only the kept prefix is live");
+
+    // A new user message now extends the truncated branch — the dropped
+    // suffix lives on as a sibling because its old root (u2) still has
+    // parent_id = a1 in storage.
+    let _u_new = session.add_message(Role::User, vec![ContentBlock::Text { text: "u_new".into(), cache_control: None }]);
+    assert_eq!(session.active_path().len(), 3);
+    assert_eq!(session.messages.len(), 7);
 }

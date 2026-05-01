@@ -1,6 +1,7 @@
 use super::client_actions::{
-    AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
-    handle_mcp_control, handle_notify_session, handle_rewind, handle_run_subagent,
+    AgentTaskContext, NotifySessionContext, handle_agent_task, handle_checkout, handle_compact,
+    handle_input_shell, handle_mcp_control, handle_notify_session, handle_rewind,
+    handle_run_subagent,
     handle_set_feature, handle_set_subagent_model, handle_split, handle_stdin_response,
     handle_transfer, handle_trigger_memory_extraction,
 };
@@ -1749,6 +1750,10 @@ pub(super) async fn handle_client(
 
             Request::Rewind { id, n } => {
                 handle_rewind(id, n, &agent, &client_event_tx);
+            }
+
+            Request::Checkout { id, target } => {
+                handle_checkout(id, target, &agent, &client_event_tx);
             }
 
             Request::McpControl { id, action, server } => {

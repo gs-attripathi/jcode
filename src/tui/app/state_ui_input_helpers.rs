@@ -68,6 +68,8 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/alignment", "Show/change default text alignment"),
     RegisteredCommand::public("/clear", "Clear conversation history"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
+    RegisteredCommand::public("/branches", "List branch tips of the conversation tree"),
+    RegisteredCommand::public("/checkout", "Switch active branch by short id"),
     RegisteredCommand::public("/poke", "Poke model to resume with incomplete todos"),
     RegisteredCommand::public("/improve", "Autonomously improve the repository"),
     RegisteredCommand::public("/refactor", "Run a safe refactor loop"),

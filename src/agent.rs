@@ -563,6 +563,7 @@ impl Agent {
                     timestamp: Some(chrono::Utc::now()),
                     tool_duration_ms: None,
                     token_usage: None,
+                    parent_id: None,
                 };
                 self.session
                     .insert_message(index + 1 + inserted + offset, stored_message);

@@ -1580,6 +1580,22 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if let Some(rest) = trimmed.strip_prefix("/checkout ") {
+                    let target = rest.trim().trim_start_matches('@');
+                    if target.is_empty() {
+                        app.push_display_message(DisplayMessage::error(
+                            "Usage: `/checkout @<short-id>`. Run `/branches` to list leaves."
+                                .to_string(),
+                        ));
+                    } else {
+                        app.push_display_message(DisplayMessage::system(format!(
+                            "Switching to branch `@{target}`…"
+                        )));
+                        remote.checkout(target).await?;
+                    }
+                    return Ok(());
+                }
+
                 if trimmed == "/compact mode" || trimmed == "/compact mode status" {
                     let mode = app
                         .remote_compaction_mode

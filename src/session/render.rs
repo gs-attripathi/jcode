@@ -188,7 +188,11 @@ pub fn render_messages_and_images_with_compacted_history(
         });
     }
 
-    for msg in session.messages.iter().skip(render_start_idx) {
+    // Render the *active branch* of the conversation tree, not the flat
+    // insertion order. For sessions that have never branched, active_path
+    // equals messages so this behaves identically to the old code.
+    let active_path = session.active_path();
+    for msg in active_path.iter().skip(render_start_idx).copied() {
         let role = match msg.display_role {
             Some(StoredDisplayRole::System) => "system",
             Some(StoredDisplayRole::BackgroundTask) => "background_task",

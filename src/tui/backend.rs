@@ -688,6 +688,19 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Ask the server to switch the active branch tip to a leaf identified by
+    /// short id suffix.
+    pub async fn checkout(&mut self, target: &str) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::Checkout {
+            id,
+            target: target.to_string(),
+        };
+        self.next_request_id += 1;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Send an MCP control action (list / reload / connect / disconnect).
     pub async fn mcp_control(&mut self, action: &str, server: Option<&str>) -> Result<u64> {
         let id = self.next_request_id;
