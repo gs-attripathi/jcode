@@ -24,6 +24,27 @@ impl JsonRpcRequest {
     }
 }
 
+/// JSON-RPC 2.0 notification — fire-and-forget, no response expected.
+/// Per spec, notifications MUST NOT carry an `id` field; receivers use
+/// the absence of `id` to distinguish notifications from requests.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: &'static str,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+impl JsonRpcNotification {
+    pub fn new(method: impl Into<String>, params: Option<Value>) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method: method.into(),
+            params,
+        }
+    }
+}
+
 /// JSON-RPC response
 #[derive(Debug, Clone, Deserialize)]
 pub struct JsonRpcResponse {

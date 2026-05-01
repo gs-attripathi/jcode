@@ -293,8 +293,11 @@ impl McpClient {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = init_result.capabilities;
         }
 
-        // Send initialized notification
-        let notif = JsonRpcRequest::new(0, "notifications/initialized", None);
+        // Send initialized notification — JSON-RPC 2.0 notifications must
+        // NOT have an `id` field. Sending one as a request causes strict
+        // servers (e.g. duckduckgo-mcp-server) to fail validation against
+        // their request schemas.
+        let notif = JsonRpcNotification::new("notifications/initialized", None);
         let msg = serde_json::to_string(&notif)? + "\n";
         self.handle.writer_tx.send(msg).await?;
 
