@@ -362,9 +362,25 @@ impl Agent {
         }
 
         // Return locked tools if available (prevents cache invalidation from
-        // MCP tools arriving asynchronously after the first API request)
+        // MCP tools arriving asynchronously after the first API request).
+        // BUT: if the registry has more tools than it had when we locked
+        // (e.g. async MCP finished registering its tools after the initial
+        // lock), invalidate so the model gets the full catalog on the next
+        // request. We pay a one-time cache miss for visibility of new
+        // tools. Compare against the registry count snapshot rather than
+        // `locked.len()` because the agent applies post-filter steps that
+        // would otherwise cause an infinite re-lock loop at the same size.
+        let current_registry_count = self.registry.tool_count().await;
         if let Some(ref locked) = self.locked_tools {
-            return locked.clone();
+            if current_registry_count <= self.locked_tools_registry_count {
+                return locked.clone();
+            }
+            logging::info(&format!(
+                "Tool list lock invalidated: registry now has {} tools (was {} at lock time)",
+                current_registry_count, self.locked_tools_registry_count
+            ));
+            self.locked_tools = None;
+            self.cache_tracker.reset();
         }
 
         let mut tools = self.registry.definitions(self.allowed_tools.as_ref()).await;
@@ -372,13 +388,16 @@ impl Agent {
             tools.retain(|tool| tool.name != "selfdev");
         }
 
-        // Lock the tool list on first call to prevent cache invalidation
-        // when MCP tools arrive asynchronously mid-session
+        // Lock the tool list so subsequent turns hit prompt cache. A later
+        // registry expansion (MCP, etc.) re-invalidates via the count
+        // snapshot above.
         logging::info(&format!(
-            "Locking tool list at {} tools for cache stability",
-            tools.len()
+            "Locking tool list at {} tools (registry count: {}) for cache stability",
+            tools.len(),
+            current_registry_count
         ));
         self.locked_tools = Some(tools.clone());
+        self.locked_tools_registry_count = current_registry_count;
         tools
     }
 

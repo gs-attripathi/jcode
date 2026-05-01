@@ -125,6 +125,15 @@ pub struct Agent {
     /// to avoid cache invalidation when MCP tools arrive asynchronously.
     /// Cleared on compaction/reset.
     locked_tools: Option<Vec<ToolDefinition>>,
+    /// Registry tool count snapshot at the time `locked_tools` was set.
+    /// Compared against the live registry count on each turn; if the live
+    /// count is higher (e.g. async MCP registration finished), the lock is
+    /// invalidated so the next request picks up the new tools. Compared
+    /// against the live tool count rather than `locked_tools.len()` because
+    /// the agent applies post-filter steps (e.g. dropping `selfdev` for
+    /// non-canary sessions) that would otherwise cause an infinite
+    /// invalidate↔re-lock loop.
+    locked_tools_registry_count: usize,
     /// Override system prompt (used by ambient mode to inject a custom prompt)
     system_prompt_override: Option<String>,
     /// Whether memory features are enabled for this session
@@ -175,6 +184,7 @@ impl Agent {
             cache_tracker: CacheTracker::new(),
             last_usage: TokenUsage::default(),
             locked_tools: None,
+            locked_tools_registry_count: 0,
             system_prompt_override: None,
             memory_enabled: crate::config::config().features.memory,
             rewind_undo_snapshot: None,
