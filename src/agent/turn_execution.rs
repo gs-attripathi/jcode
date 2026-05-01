@@ -176,6 +176,23 @@ impl Agent {
         self.persist_session_best_effort("checkout");
     }
 
+    /// Append a UI/navigation note to the active branch and persist. Used by
+    /// /rewind and /checkout so the user can see in scroll-back what they
+    /// did to navigate the tree.
+    pub fn record_system_note(&mut self, text: impl Into<String>) {
+        self.session.add_system_note(text);
+        self.persist_session_best_effort("system_note");
+    }
+
+    /// Record a user-typed slash command (e.g. "/rewind 1") on the active
+    /// branch so it shows up in scroll-back styled as a user message. Used
+    /// alongside `record_system_note` so the chat shows both what the user
+    /// typed and the system's reply.
+    pub fn record_user_command(&mut self, text: impl Into<String>) {
+        self.session.add_user_command(text);
+        self.persist_session_best_effort("user_command");
+    }
+
     /// Number of user prompts on the *active branch* (matches the on-screen
     /// prompt counter). A "user prompt" is a `Role::User` stored message that
     /// contains at least one `Text` content block — this excludes user-role

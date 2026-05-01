@@ -1373,7 +1373,9 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             ));
             return true;
         }
-        let active = session_ref.active_leaf_id.clone();
+        // The "current" leaf is the real (non-system) message at the tip of
+        // the active branch — walk past navigation notes to find it.
+        let active = session_ref.active_real_leaf().map(|m| m.id.clone());
         let mut sorted: Vec<&crate::session::StoredMessage> = leaves;
         sorted.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
 

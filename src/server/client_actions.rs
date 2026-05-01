@@ -887,6 +887,15 @@ pub(super) fn handle_rewind(
                     }
                 }
             };
+            if truncated {
+                // Record the typed command first so it appears above the
+                // system reply in scroll-back, mirroring chat order.
+                agent_guard.record_user_command(format!("/rewind {n}"));
+                agent_guard.record_system_note(format!(
+                    "✓ Rewound to prompt {kept}. Removed {removed} message{}.",
+                    if removed == 1 { "" } else { "s" }
+                ));
+            }
             let (history, _images) = agent_guard.get_history_and_rendered_images();
             (
                 ServerEvent::Rewound {
@@ -960,6 +969,9 @@ pub(super) fn handle_checkout(
             }
 
             agent_guard.checkout_active_leaf(resolved_id.clone());
+            let short = crate::session::Session::short_id(&resolved_id);
+            agent_guard.record_user_command(format!("/checkout @{}", short));
+            agent_guard.record_system_note(format!("✓ Switched to branch `@{}`.", short));
             let kept = agent_guard.user_prompt_count();
             let (history, _images) = agent_guard.get_history_and_rendered_images();
             (

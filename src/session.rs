@@ -179,6 +179,11 @@ pub struct StoredMessage {
 pub enum StoredDisplayRole {
     System,
     BackgroundTask,
+    /// Slash command typed by the user (e.g. `/rewind 1`). Stored so it
+    /// shows up in scroll-back styled as a user message, but excluded from
+    /// the LLM-bound provider message stream (the model shouldn't see
+    /// navigation commands as if the user said them in conversation).
+    UserCommand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1790,6 +1795,38 @@ impl Session {
         self.mark_messages_append_dirty();
     }
 
+    /// Append a UI/navigation note (e.g. "✓ Switched to branch @abc.") to
+    /// the active branch. Stored as a regular message with
+    /// `display_role = System` so it persists across sessions and shows up
+    /// in scroll-back, but is filtered out of the LLM-bound provider message
+    /// stream and out of `/branches` leaf labelling so it doesn't pollute
+    /// either.
+    pub fn add_system_note(&mut self, text: impl Into<String>) -> String {
+        self.add_message_with_display_role(
+            Role::Assistant,
+            vec![ContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
+            Some(StoredDisplayRole::System),
+        )
+    }
+
+    /// Append a record of a user-typed slash command (e.g. "/rewind 1") so
+    /// the user can see in scroll-back what they typed to navigate the
+    /// tree. Renders as a user-styled message but is excluded from LLM
+    /// context and from `/branches` leaf detection.
+    pub fn add_user_command(&mut self, text: impl Into<String>) -> String {
+        self.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
+            Some(StoredDisplayRole::UserCommand),
+        )
+    }
+
     /// Move the active branch tip to `leaf_id`. Caller must ensure the id
     /// belongs to a message in this session. Invalidates the provider message
     /// cache because the path may have changed shape (different branch).
@@ -1801,19 +1838,40 @@ impl Session {
         self.mark_messages_full_dirty();
     }
 
-    /// All messages that no other message claims as a parent — i.e. the
-    /// branch tips. For a single-branch session this returns just the last
-    /// message. For trees, one entry per branch.
+    /// All "real" branch tips: messages with no non-system children. System
+    /// notes (display_role = System) are navigation markers, not branches in
+    /// their own right, so they're skipped both as candidates and when
+    /// counting children. For a single-branch session with no checkouts this
+    /// returns just the last conversation message.
     pub fn leaves(&self) -> Vec<&StoredMessage> {
-        let parent_ids: std::collections::HashSet<&str> = self
+        let real_parents: std::collections::HashSet<&str> = self
             .messages
             .iter()
+            .filter(|m| m.display_role.is_none())
             .filter_map(|m| m.parent_id.as_deref())
             .collect();
         self.messages
             .iter()
-            .filter(|m| !parent_ids.contains(m.id.as_str()))
+            .filter(|m| m.display_role.is_none() && !real_parents.contains(m.id.as_str()))
             .collect()
+    }
+
+    /// Resolve `active_leaf_id` back through system notes to the most recent
+    /// "real" ancestor — the conversation message that the user thinks of as
+    /// the current branch tip. Returns the active leaf id itself if it's
+    /// already a real message, or `None` if the active leaf is unset/missing.
+    pub fn active_real_leaf(&self) -> Option<&StoredMessage> {
+        let leaf_id = self.active_leaf_id.as_deref()?;
+        let by_id: std::collections::HashMap<&str, &StoredMessage> = self
+            .messages
+            .iter()
+            .map(|m| (m.id.as_str(), m))
+            .collect();
+        let mut cur = by_id.get(leaf_id).copied()?;
+        while cur.display_role.is_some() {
+            cur = cur.parent_id.as_deref().and_then(|p| by_id.get(p).copied())?;
+        }
+        Some(cur)
     }
 
     /// Look up a message by a short id suffix (the last 4–8 chars of its
@@ -1992,9 +2050,13 @@ impl Session {
         // Build the LLM-bound message list from the *active branch* of the
         // conversation tree, not from the flat insertion order. For sessions
         // that never branch, active_path == messages so nothing changes.
+        // Display-only system notes (slash-command receipts) are excluded so
+        // the model doesn't see "✓ Switched to branch @abc" as something it
+        // said.
         let path_messages: Vec<Message> = self
             .active_path()
             .iter()
+            .filter(|m| m.display_role.is_none())
             .map(|m| m.to_message())
             .collect();
         let path_len = path_messages.len();
@@ -2041,7 +2103,12 @@ impl Session {
     pub fn messages_for_provider_uncached(&self) -> Vec<Message> {
         // Active branch only — same semantics as `provider_messages`, but
         // bypasses the cache for callers that don't want a mutable borrow.
-        self.active_path().iter().map(|m| m.to_message()).collect()
+        // Skip display-only system notes so the LLM doesn't see them.
+        self.active_path()
+            .iter()
+            .filter(|m| m.display_role.is_none())
+            .map(|m| m.to_message())
+            .collect()
     }
 
     pub fn messages_for_provider(&mut self) -> Vec<Message> {
