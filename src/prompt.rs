@@ -1,6 +1,6 @@
 //! System prompt management
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Default system prompt for jcode (embedded at compile time)
@@ -484,14 +484,34 @@ pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<Stri
         contents.push(content);
     }
 
-    // Home directory files
-    if let Ok(global_agents_md) = crate::storage::user_home_path("AGENTS.md")
-        && let Some((content, size)) =
-            load_file(&global_agents_md, "Global Instructions (~/.AGENTS.md)")
-    {
-        info.has_global_agents_md = true;
-        info.global_agents_md_chars = size;
-        contents.push(content);
+    // Global instructions: prefer a jcode-specific file at
+    // `$JCODE_HOME/AGENTS.md` (default `~/.jcode/AGENTS.md`) so users can
+    // keep separate global instructions for jcode vs other AGENTS.md-aware
+    // tools (e.g. Claude Code reads `~/.claude/CLAUDE.md`, jcode reads
+    // `~/AGENTS.md` — sharing them tends to leak Claude-Code-specific
+    // tool names like ToolSearch / mcp__context7 into jcode's prompt and
+    // confuse the agent). Falls back to `~/AGENTS.md` if no
+    // jcode-specific file exists, preserving prior behavior.
+    let jcode_dir_agents_md = crate::storage::jcode_dir()
+        .ok()
+        .map(|d| d.join("AGENTS.md"));
+    let home_agents_md = crate::storage::user_home_path("AGENTS.md").ok();
+    let candidates: Vec<PathBuf> = jcode_dir_agents_md
+        .into_iter()
+        .chain(home_agents_md)
+        .collect();
+    for path in candidates {
+        let label = if path.starts_with(crate::storage::jcode_dir().unwrap_or_default()) {
+            "Global Instructions ($JCODE_HOME/AGENTS.md)"
+        } else {
+            "Global Instructions (~/AGENTS.md)"
+        };
+        if let Some((content, size)) = load_file(&path, label) {
+            info.has_global_agents_md = true;
+            info.global_agents_md_chars = size;
+            contents.push(content);
+            break; // first hit wins; jcode-specific overrides shared
+        }
     }
 
     if contents.is_empty() {
