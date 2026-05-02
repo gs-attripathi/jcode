@@ -1,37 +1,18 @@
 use super::{Session, StoredDisplayRole};
 use crate::message::{ContentBlock, Role, ToolCall};
-use serde::{Deserialize, Serialize};
+pub use jcode_session_types::{
+    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageSource, RenderedMessage,
+};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RenderedMessage {
-    pub role: String,
-    pub content: String,
-    pub tool_calls: Vec<String>,
-    pub tool_data: Option<ToolCall>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RenderedCompactedHistoryInfo {
-    pub total_messages: usize,
-    pub visible_messages: usize,
-    pub remaining_messages: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RenderedImageSource {
-    UserInput,
-    ToolResult { tool_name: String },
-    Other { role: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RenderedImage {
-    pub media_type: String,
-    pub data: String,
-    pub label: Option<String>,
-    pub source: RenderedImageSource,
+fn is_internal_system_reminder(msg: &super::StoredMessage) -> bool {
+    msg.content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.trim_start()),
+            _ => None,
+        })
+        .is_some_and(|text| text.starts_with("<system-reminder>"))
 }
 
 fn image_source_for_message(role: Role, tool: Option<&ToolCall>) -> RenderedImageSource {
@@ -193,6 +174,10 @@ pub fn render_messages_and_images_with_compacted_history(
     // equals messages so this behaves identically to the old code.
     let active_path = session.active_path();
     for msg in active_path.iter().skip(render_start_idx).copied() {
+        if is_internal_system_reminder(msg) {
+            continue;
+        }
+
         let role = match msg.display_role {
             Some(StoredDisplayRole::System) => "system",
             Some(StoredDisplayRole::BackgroundTask) => "background_task",

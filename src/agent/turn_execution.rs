@@ -1,14 +1,5 @@
 use super::*;
 
-fn is_user_prompt(msg: &StoredMessage) -> bool {
-    matches!(msg.role, Role::User)
-        && msg.display_role.is_none()
-        && msg
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Text { .. }))
-}
-
 impl Agent {
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
@@ -141,10 +132,13 @@ impl Agent {
         let mut new_session = Session::create(None, None);
         new_session.mark_active();
         new_session.model = Some(self.provider.model());
+        new_session.provider_key =
+            crate::session::derive_session_provider_key(self.provider.name());
         new_session.is_canary = preserve_canary;
         new_session.testing_build = preserve_testing_build;
         new_session.is_debug = preserve_debug;
         new_session.working_dir = preserve_working_dir;
+        new_session.ensure_initial_session_context_message();
 
         self.session = new_session;
         self.reset_runtime_state_for_session_change();
@@ -159,96 +153,57 @@ impl Agent {
         self.persist_session_best_effort("provider session reset");
     }
 
-    /// Read-only view of the underlying session for tree introspection
-    /// (`leaves()`, `find_message_by_short_id`, etc.).
-    pub fn session_ref(&self) -> &Session {
-        &self.session
-    }
-
-    /// Switch the active branch tip to `leaf_id`. Caller must have validated
-    /// that the id refers to a real message in this session. Resets the
-    /// provider session id so the next API call rebuilds context for the
-    /// newly-active branch instead of trying to resume the old one.
-    pub fn checkout_active_leaf(&mut self, leaf_id: String) {
-        self.session.set_active_leaf(leaf_id);
-        self.provider_session_id = None;
-        self.session.provider_session_id = None;
-        self.persist_session_best_effort("checkout");
-    }
-
-    /// Append a UI/navigation note to the active branch and persist. Used by
-    /// /rewind and /checkout so the user can see in scroll-back what they
-    /// did to navigate the tree.
-    pub fn record_system_note(&mut self, text: impl Into<String>) {
-        self.session.add_system_note(text);
-        self.persist_session_best_effort("system_note");
-    }
-
-    /// Record a user-typed slash command (e.g. "/rewind 1") on the active
-    /// branch so it shows up in scroll-back styled as a user message. Used
-    /// alongside `record_system_note` so the chat shows both what the user
-    /// typed and the system's reply.
-    pub fn record_user_command(&mut self, text: impl Into<String>) {
-        self.session.add_user_command(text);
-        self.persist_session_best_effort("user_command");
-    }
-
-    /// Number of user prompts on the *active branch* (matches the on-screen
-    /// prompt counter). A "user prompt" is a `Role::User` stored message that
-    /// contains at least one `Text` content block — this excludes user-role
-    /// tool-result messages.
-    pub fn user_prompt_count(&self) -> usize {
-        self.session
-            .active_path()
-            .iter()
-            .filter(|m| is_user_prompt(m))
-            .count()
-    }
-
-    /// Rewind the active branch so that the first `prompt_n` user prompts
-    /// (and the assistant turns that completed each) are kept, dropping
-    /// everything from the `(prompt_n + 1)`-th user prompt onward. Returns
-    /// `(kept_prompts, removed_messages)`. Returns `None` if `prompt_n` is
-    /// greater than the current user-prompt count.
+    /// Rewind the conversation to a 1-based visible conversation message index.
     ///
-    /// Tree-aware: storage is *not* truncated. Instead the active leaf is
-    /// moved back to the last kept message, leaving the dropped suffix as an
-    /// orphan branch that becomes a sibling next time the user prompts.
-    pub fn rewind_to_prompt(&mut self, prompt_n: usize) -> Option<(usize, usize)> {
-        if prompt_n == 0 {
-            return None;
-        }
-        let (new_leaf_id, removed, total_prompts) = {
-            let path = self.session.active_path();
-            let user_indices: Vec<usize> = path
-                .iter()
-                .enumerate()
-                .filter_map(|(i, m)| if is_user_prompt(m) { Some(i) } else { None })
-                .collect();
-            let total_prompts = user_indices.len();
-            if prompt_n > total_prompts {
-                return None;
-            }
-            if prompt_n == total_prompts {
-                return Some((prompt_n, 0));
-            }
-            // Drop everything from the (prompt_n)th index in user_indices
-            // onward (0-based), so user_indices[prompt_n] is the first
-            // dropped position. The kept tip sits one earlier in the path.
-            let drop_at = user_indices[prompt_n];
-            // drop_at is guaranteed >= 1 because user_indices[0] would have
-            // had to come first; prompt_n >= 1 here, so drop_at points past
-            // the first user prompt.
-            let new_leaf = path[drop_at - 1].id.clone();
-            let removed = path.len() - drop_at;
-            (new_leaf, removed, total_prompts)
+    /// Provider-side resumable sessions are reset so the next request sends the
+    /// truncated context from scratch instead of continuing from a stale upstream
+    /// conversation.
+    pub fn rewind_to_message(&mut self, message_index: usize) -> Result<usize, String> {
+        let message_count = self.session.visible_conversation_message_count();
+        let Some(stored_len) = self
+            .session
+            .stored_len_for_visible_conversation_message(message_index)
+        else {
+            return Err(format!(
+                "Invalid message number: {}. Valid range: 1-{}",
+                message_index, message_count
+            ));
         };
-        let _ = total_prompts; // documented above; not used after the borrow
-        self.session.set_active_leaf(new_leaf_id);
+
+        let removed = message_count - message_index;
+        self.rewind_undo_snapshot = Some(RewindUndoSnapshot {
+            messages: self.session.messages.clone(),
+            provider_session_id: self.provider_session_id.clone(),
+            session_provider_session_id: self.session.provider_session_id.clone(),
+            visible_message_count: message_count,
+        });
+        self.session.truncate_messages(stored_len);
+        self.session.updated_at = chrono::Utc::now();
         self.provider_session_id = None;
         self.session.provider_session_id = None;
-        self.persist_session_best_effort("rewind");
-        Some((prompt_n, removed))
+        self.cache_tracker.reset();
+        self.locked_tools = None;
+        self.reset_tool_output_tracking();
+        self.persist_session_best_effort("conversation rewind");
+        Ok(removed)
+    }
+
+    pub fn undo_rewind(&mut self) -> Result<usize, String> {
+        let Some(snapshot) = self.rewind_undo_snapshot.take() else {
+            return Err("No rewind to undo.".to_string());
+        };
+
+        let current_count = self.session.visible_conversation_message_count();
+        let restored = snapshot.visible_message_count.saturating_sub(current_count);
+        self.session.replace_messages(snapshot.messages);
+        self.provider_session_id = snapshot.provider_session_id;
+        self.session.provider_session_id = snapshot.session_provider_session_id;
+        self.session.updated_at = chrono::Utc::now();
+        self.cache_tracker.reset();
+        self.locked_tools = None;
+        self.reset_tool_output_tracking();
+        self.persist_session_best_effort("conversation rewind undo");
+        Ok(restored)
     }
 
     /// Unlock the tool list so the next API request picks up any new tools.
@@ -325,25 +280,9 @@ impl Agent {
         }
 
         // Return locked tools if available (prevents cache invalidation from
-        // MCP tools arriving asynchronously after the first API request).
-        // BUT: if the registry has more tools than it had when we locked
-        // (e.g. async MCP finished registering its tools after the initial
-        // lock), invalidate so the model gets the full catalog on the next
-        // request. We pay a one-time cache miss for visibility of new
-        // tools. Compare against the registry count snapshot rather than
-        // `locked.len()` because the agent applies post-filter steps that
-        // would otherwise cause an infinite re-lock loop at the same size.
-        let current_registry_count = self.registry.tool_count().await;
+        // MCP tools arriving asynchronously after the first API request)
         if let Some(ref locked) = self.locked_tools {
-            if current_registry_count <= self.locked_tools_registry_count {
-                return locked.clone();
-            }
-            logging::info(&format!(
-                "Tool list lock invalidated: registry now has {} tools (was {} at lock time)",
-                current_registry_count, self.locked_tools_registry_count
-            ));
-            self.locked_tools = None;
-            self.cache_tracker.reset();
+            return locked.clone();
         }
 
         let mut tools = self.registry.definitions(self.allowed_tools.as_ref()).await;
@@ -351,16 +290,13 @@ impl Agent {
             tools.retain(|tool| tool.name != "selfdev");
         }
 
-        // Lock the tool list so subsequent turns hit prompt cache. A later
-        // registry expansion (MCP, etc.) re-invalidates via the count
-        // snapshot above.
+        // Lock the tool list on first call to prevent cache invalidation
+        // when MCP tools arrive asynchronously mid-session
         logging::info(&format!(
-            "Locking tool list at {} tools (registry count: {}) for cache stability",
-            tools.len(),
-            current_registry_count
+            "Locking tool list at {} tools for cache stability",
+            tools.len()
         ));
         self.locked_tools = Some(tools.clone());
-        self.locked_tools_registry_count = current_registry_count;
         tools
     }
 
@@ -489,7 +425,9 @@ impl Agent {
 
         let model_start = Instant::now();
         if let Some(model) = self.session.model.clone() {
-            if let Err(e) = self.provider.set_model(&model) {
+            if let Err(e) =
+                crate::provider::set_model_with_auth_refresh(self.provider.as_ref(), &model)
+            {
                 logging::error(&format!(
                     "Failed to restore session model '{}': {}",
                     model, e

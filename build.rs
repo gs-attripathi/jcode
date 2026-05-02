@@ -129,10 +129,6 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=JCODE_RELEASE_BUILD");
     println!("cargo:rerun-if-env-changed=JCODE_BUILD_SEMVER");
-    let rerun_stamp = build_rerun_stamp_file();
-    touch_build_stamp(&rerun_stamp)
-        .unwrap_or_else(|err| eprintln!("cargo:warning=failed to update build rerun stamp: {err}"));
-    println!("cargo:rerun-if-changed={}", rerun_stamp.display());
 }
 
 fn parse_semver(value: &str) -> Option<(u32, u32, u32)> {
@@ -196,28 +192,6 @@ fn build_counter_file() -> PathBuf {
         .join("target")
         .join("jcode-build")
         .join("patch-counters.txt")
-}
-
-fn build_rerun_stamp_file() -> PathBuf {
-    build_counter_file()
-        .parent()
-        .unwrap_or_else(|| Path::new("target"))
-        .join("rerun-stamp.txt")
-}
-
-fn touch_build_stamp(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let stamp = format!("{}\n", chrono_like_timestamp());
-    fs::write(path, stamp)
-}
-
-fn chrono_like_timestamp() -> String {
-    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => format!("{}.{:09}", duration.as_secs(), duration.subsec_nanos()),
-        Err(_) => "0.000000000".to_string(),
-    }
 }
 
 fn target_root_from_out_dir() -> Option<PathBuf> {

@@ -38,7 +38,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web (DuckDuckGo) and return title, URL, and snippet for the top results. Use this whenever the user asks you to look something up online, find current information, check facts, identify a person/product/event, compare options, or anything else that requires up-to-date knowledge from the internet rather than your training data. Prefer this over guessing from memory and over running shell-based curl/scraping. No API key required."
+        "Search the web."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -49,11 +49,11 @@ impl Tool for WebSearchTool {
                 "intent": super::intent_schema_property(),
                 "query": {
                     "type": "string",
-                    "description": "The search query — what you'd type into a search box. Use natural language; quotes for exact phrases work."
+                    "description": "Search query."
                 },
                 "num_results": {
                     "type": "integer",
-                    "description": "Max results to return (default 8, max 20)."
+                    "description": "Max results."
                 }
             }
         })

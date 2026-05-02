@@ -281,8 +281,10 @@ pub(super) fn reset_current_session(app: &mut App) {
     let mut session = Session::create(None, None);
     session.mark_active();
     session.model = Some(app.provider.model());
+    session.provider_key = crate::session::derive_session_provider_key(app.provider.name());
     session.autoreview_enabled = Some(app.autoreview_enabled);
     session.autojudge_enabled = Some(app.autojudge_enabled);
+    session.ensure_initial_session_context_message();
     app.session = session;
     app.set_side_panel_snapshot(crate::side_panel::SidePanelSnapshot::default());
     app.last_side_panel_focus_id = None;

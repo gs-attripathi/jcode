@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
+use super::append_swarm_completion_report_instructions;
 use super::swarm::{now_unix_ms, swarm_task_heartbeat_interval, touch_swarm_task_progress};
 use super::swarm_mutation_state::{
     PersistedSwarmMutationResponse, begin_or_replay as begin_swarm_mutation_or_replay,
@@ -10,11 +11,11 @@ use super::{
     SwarmState, SwarmTaskProgress, VersionedPlan, broadcast_swarm_plan,
     broadcast_swarm_plan_with_previous, broadcast_swarm_status, fanout_session_event,
     persist_swarm_state_for, queue_soft_interrupt_for_session, record_swarm_event, truncate_detail,
-    update_member_status,
+    update_member_status, update_member_status_with_report,
 };
 use crate::agent::Agent;
 use crate::plan::{
-    cycle_item_ids, is_terminal_status, missing_dependencies, next_runnable_item_ids,
+    PlanItem, cycle_item_ids, is_terminal_status, missing_dependencies, next_runnable_item_ids,
     unresolved_dependencies,
 };
 use crate::protocol::{NotificationType, PlanGraphStatus, ServerEvent};
@@ -300,6 +301,53 @@ async fn resolve_assignment_target_session(
         })
 }
 
+async fn task_id_for_target_session(
+    swarm_id: &str,
+    target_session: &str,
+    action: TaskControlAction,
+    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+) -> Result<String, String> {
+    let plans = swarm_plans.read().await;
+    let Some(plan) = plans.get(swarm_id) else {
+        return Err("No swarm plan exists for this swarm.".to_string());
+    };
+
+    let mut candidates: Vec<&PlanItem> = plan
+        .items
+        .iter()
+        .filter(|item| item.assigned_to.as_deref() == Some(target_session))
+        .filter(|item| action_allows_status(action, &item.status))
+        .collect();
+
+    candidates.sort_by_key(|item| match item.status.as_str() {
+        "running" | "running_stale" => 0,
+        "queued" | "ready" | "pending" | "todo" => 1,
+        "failed" | "stopped" | "crashed" => 2,
+        "completed" | "done" => 3,
+        _ => 4,
+    });
+
+    match candidates.as_slice() {
+        [] => Err(format!(
+            "No task assigned to '{}' can be {}. Provide task_id explicitly, or assign a task first.",
+            target_session,
+            action.as_str()
+        )),
+        [item] => Ok(item.id.clone()),
+        [first, second, ..] if first.status != second.status => Ok(first.id.clone()),
+        _ => Err(format!(
+            "Multiple tasks assigned to '{}' can be {}: {}. Provide task_id explicitly.",
+            target_session,
+            action.as_str(),
+            candidates
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 async fn next_unassigned_runnable_task_id(
     swarm_id: &str,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
@@ -452,6 +500,7 @@ fn spawn_assigned_task_run(
     event_counter: Arc<std::sync::atomic::AtomicU64>,
     swarm_event_tx: broadcast::Sender<SwarmEvent>,
 ) {
+    let assignment_text = append_swarm_completion_report_instructions(&assignment_text);
     tokio::spawn(async move {
         {
             let now_ms = now_unix_ms();
@@ -563,6 +612,10 @@ fn spawn_assigned_task_run(
             Arc::clone(&event_counter),
             swarm_event_tx.clone(),
         );
+        let start_message_index = {
+            let agent = agent_arc.lock().await;
+            agent.message_count()
+        };
         let result = super::client_lifecycle::process_message_streaming_mpsc(
             Arc::clone(&agent_arc),
             &assignment_text,
@@ -571,6 +624,12 @@ fn spawn_assigned_task_run(
             event_tx,
         )
         .await;
+        let completion_report = if result.is_ok() {
+            let agent = agent_arc.lock().await;
+            agent.latest_assistant_text_after(start_message_index)
+        } else {
+            None
+        };
         let _ = heartbeat_stop_tx.send(true);
         let _ = heartbeat_task.await;
 
@@ -617,10 +676,11 @@ fn spawn_assigned_task_run(
                     &swarms_by_id,
                 )
                 .await;
-                update_member_status(
+                update_member_status_with_report(
                     &target_session,
                     "completed",
                     None,
+                    completion_report,
                     &swarm_members,
                     &swarms_by_id,
                     Some(&event_history),
@@ -1271,6 +1331,7 @@ pub(super) async fn handle_comm_assign_task(
     } else {
         format!("Task assigned to you by coordinator: {}", content)
     };
+    let queued_task_prompt = append_swarm_completion_report_instructions(&notification);
 
     let target_agent = {
         let agent_sessions = sessions.read().await;
@@ -1278,7 +1339,7 @@ pub(super) async fn handle_comm_assign_task(
     };
     let _ = queue_soft_interrupt_for_session(
         &target_session,
-        notification.clone(),
+        queued_task_prompt,
         false,
         SoftInterruptSource::System,
         soft_interrupt_queues,
@@ -1372,6 +1433,7 @@ pub(super) async fn handle_comm_assign_next(
     id: u64,
     req_session_id: String,
     target_session: Option<String>,
+    working_dir: Option<String>,
     prefer_spawn: Option<bool>,
     spawn_if_needed: Option<bool>,
     message: Option<String>,
@@ -1432,7 +1494,7 @@ pub(super) async fn handle_comm_assign_next(
             match super::comm_session::spawn_swarm_agent(
                 &req_session_id,
                 &swarm_id,
-                None,
+                working_dir.clone(),
                 None,
                 sessions,
                 global_session_id,
@@ -1584,6 +1646,33 @@ pub(super) async fn handle_comm_task_control(
     {
         Some(swarm_id) => swarm_id,
         None => return,
+    };
+
+    let task_id = if task_id.trim().is_empty() {
+        let Some(target_session) = target_session.as_deref() else {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: format!(
+                    "task_id is required for {} unless target_session uniquely identifies an assigned task.",
+                    action.as_str()
+                ),
+                retry_after_secs: None,
+            });
+            return;
+        };
+        match task_id_for_target_session(&swarm_id, target_session, action, swarm_plans).await {
+            Ok(task_id) => task_id,
+            Err(message) => {
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id,
+                    message,
+                    retry_after_secs: None,
+                });
+                return;
+            }
+        }
+    } else {
+        task_id
     };
 
     let Some(snapshot) = task_snapshot_for(&swarm_id, &task_id, swarm_plans).await else {
@@ -1744,6 +1833,7 @@ pub(super) async fn handle_comm_task_control(
             }
 
             if action == TaskControlAction::Wake {
+                let assignment_text = append_swarm_completion_report_instructions(&assignment_text);
                 let wake_message = format!(
                     "Coordinator requested you wake and continue task '{}'.\n\n{}",
                     task_id, assignment_text

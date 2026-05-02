@@ -4,7 +4,9 @@
 )]
 
 use super::debug_ambient::maybe_handle_ambient_command;
-use super::debug_command_exec::{execute_debug_command, resolve_debug_session};
+use super::debug_command_exec::{
+    DebugInterruptContext, execute_debug_command, resolve_debug_session,
+};
 use super::debug_events::{
     maybe_handle_event_query_command, maybe_handle_event_subscription_command,
 };
@@ -527,6 +529,13 @@ pub(super) async fn handle_debug_client(
                                         cmd,
                                         Arc::clone(&debug_jobs),
                                         Some(&server_identity),
+                                        Some(DebugInterruptContext {
+                                            session_id: _session,
+                                            shutdown_signals: Arc::clone(&shutdown_signals),
+                                            soft_interrupt_queues: Arc::clone(
+                                                &soft_interrupt_queues,
+                                            ),
+                                        }),
                                     )
                                     .await
                                 }

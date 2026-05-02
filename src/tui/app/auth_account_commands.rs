@@ -856,15 +856,8 @@ fn render_provider_settings_markdown(app: &App, provider_id: &str) -> String {
     ));
     lines.push(String::new());
 
-    let recommended_actions = crate::auth::doctor::recommended_actions(
-        provider,
-        status.state_for_provider(provider),
-        validation
-            .get(provider.id)
-            .map(crate::auth::validation::format_record_label)
-            .as_deref(),
-        None,
-    );
+    let assessment = status.assessment_for_provider(provider);
+    let recommended_actions = crate::auth::doctor::recommended_actions(provider, &assessment, None);
     if !recommended_actions.is_empty() {
         lines.push("**Recommended next steps**".to_string());
         for action in recommended_actions {
@@ -997,16 +990,10 @@ fn render_auth_doctor_markdown(provider_filter: Option<&str>) -> String {
         let validation_label = validation
             .get(provider.id)
             .map(crate::auth::validation::format_record_label);
-        let recommended_actions = crate::auth::doctor::recommended_actions(
-            provider,
-            assessment.state,
-            validation_label.as_deref(),
-            None,
-        );
-        let needs_attention = assessment.state != crate::auth::AuthState::Available
-            || validation_label
-                .as_deref()
-                .is_some_and(|value| value.contains("validation failed"));
+        let recommended_actions =
+            crate::auth::doctor::recommended_actions(provider, &assessment, None);
+        let diagnostics = crate::auth::doctor::diagnostics(provider, &assessment, None);
+        let needs_attention = crate::auth::doctor::needs_attention(&assessment, None);
 
         let mut lines = vec![format!("**{}** (`{}`)", provider.display_name, provider.id)];
         lines.push(format!(
@@ -1020,6 +1007,25 @@ fn render_auth_doctor_markdown(provider_filter: Option<&str>) -> String {
         lines.push(format!("- Method: {}", assessment.method_detail));
         lines.push(format!("- Health: {}", assessment.health_summary()));
         lines.push(format!(
+            "- Credential source: {} ({})",
+            assessment.credential_source.label(),
+            assessment.credential_source_detail
+        ));
+        lines.push(format!("- Refresh: {}", assessment.refresh_support.label()));
+        lines.push(format!(
+            "- Validation method: {}",
+            assessment.validation_method.label()
+        ));
+        lines.push(format!(
+            "- Last refresh: {}",
+            assessment
+                .last_refresh
+                .as_ref()
+                .map(crate::auth::refresh_state::format_record_label)
+                .as_deref()
+                .unwrap_or("not recorded")
+        ));
+        lines.push(format!(
             "- Validation: {}",
             validation_label.as_deref().unwrap_or("not validated")
         ));
@@ -1027,6 +1033,13 @@ fn render_auth_doctor_markdown(provider_filter: Option<&str>) -> String {
             "- Needs attention: {}",
             if needs_attention { "yes" } else { "no" }
         ));
+        if !diagnostics.is_empty() {
+            lines.push(String::new());
+            lines.push("**Diagnostics**".to_string());
+            for diagnostic in diagnostics {
+                lines.push(format!("- {}", diagnostic));
+            }
+        }
         if !recommended_actions.is_empty() {
             lines.push(String::new());
             lines.push("**Next steps**".to_string());

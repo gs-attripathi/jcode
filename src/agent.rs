@@ -76,6 +76,14 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct RewindUndoSnapshot {
+    messages: Vec<StoredMessage>,
+    provider_session_id: Option<String>,
+    session_provider_session_id: Option<String>,
+    visible_message_count: usize,
+}
+
 pub struct Agent {
     provider: Arc<dyn Provider>,
     registry: Registry,
@@ -117,19 +125,12 @@ pub struct Agent {
     /// to avoid cache invalidation when MCP tools arrive asynchronously.
     /// Cleared on compaction/reset.
     locked_tools: Option<Vec<ToolDefinition>>,
-    /// Registry tool count snapshot at the time `locked_tools` was set.
-    /// Compared against the live registry count on each turn; if the live
-    /// count is higher (e.g. async MCP registration finished), the lock is
-    /// invalidated so the next request picks up the new tools. Compared
-    /// against the live tool count rather than `locked_tools.len()` because
-    /// the agent applies post-filter steps (e.g. dropping `selfdev` for
-    /// non-canary sessions) that would otherwise cause an infinite
-    /// invalidate↔re-lock loop.
-    locked_tools_registry_count: usize,
     /// Override system prompt (used by ambient mode to inject a custom prompt)
     system_prompt_override: Option<String>,
     /// Whether memory features are enabled for this session
     memory_enabled: bool,
+    /// One-step undo snapshot captured before the most recent rewind.
+    rewind_undo_snapshot: Option<RewindUndoSnapshot>,
     /// Channel for tools to request stdin input from the user
     stdin_request_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tool::StdinInputRequest>>,
 }
@@ -174,9 +175,9 @@ impl Agent {
             cache_tracker: CacheTracker::new(),
             last_usage: TokenUsage::default(),
             locked_tools: None,
-            locked_tools_registry_count: 0,
             system_prompt_override: None,
             memory_enabled: crate::config::config().features.memory,
+            rewind_undo_snapshot: None,
             stdin_request_tx: None,
         }
     }
@@ -203,6 +204,7 @@ impl Agent {
         agent.session.model = Some(agent.provider.model());
         agent.session.provider_key =
             crate::session::derive_session_provider_key(agent.provider.name());
+        agent.session.ensure_initial_session_context_message();
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("create");
         crate::telemetry::begin_session(agent.provider.name(), &agent.provider.model());
@@ -222,7 +224,9 @@ impl Agent {
                 crate::session::derive_session_provider_key(agent.provider.name());
         }
         if let Some(model) = agent.session.model.clone() {
-            if let Err(e) = agent.provider.set_model(&model) {
+            if let Err(e) =
+                crate::provider::set_model_with_auth_refresh(agent.provider.as_ref(), &model)
+            {
                 logging::error(&format!(
                     "Failed to restore session model '{}': {}",
                     model, e
@@ -231,6 +235,7 @@ impl Agent {
         } else {
             agent.session.model = Some(agent.provider.model());
         }
+        agent.session.ensure_initial_session_context_message();
         agent.sync_memory_dedup_state_from_session();
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("attach");
@@ -330,6 +335,7 @@ impl Agent {
         self.cache_tracker.reset();
         self.last_usage = TokenUsage::default();
         self.locked_tools = None;
+        self.rewind_undo_snapshot = None;
     }
 
     fn sync_session_compaction_state_from_manager(

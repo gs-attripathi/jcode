@@ -1,5 +1,6 @@
 use super::*;
 use crate::tui::app as app_mod;
+use crate::tui::app::PendingRemoteRewindNotice;
 use crate::tui::core;
 
 pub(in crate::tui::app) fn handle_remote_char_input(app: &mut App, c: char) {
@@ -28,6 +29,139 @@ pub(in crate::tui::app) async fn send_interleave_now(
             app.set_status_notice("⏭ Interleave sent");
         }
     }
+}
+
+async fn apply_remote_effort_direction(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    direction: i8,
+) -> Result<()> {
+    let efforts = ["none", "low", "medium", "high", "xhigh"];
+    let current = app.remote_reasoning_effort.as_deref();
+    let current_index = current
+        .and_then(|c| efforts.iter().position(|e| *e == c))
+        .unwrap_or(efforts.len() - 1);
+    let len = efforts.len();
+    let next_index = if direction > 0 {
+        if current_index + 1 >= len {
+            current_index
+        } else {
+            current_index + 1
+        }
+    } else if current_index == 0 {
+        0
+    } else {
+        current_index - 1
+    };
+    let next_effort = efforts[next_index];
+    if Some(next_effort) == current {
+        let label = app_mod::effort_display_label(next_effort);
+        app.set_status_notice(format!(
+            "Effort: {} (already at {})",
+            label,
+            if direction > 0 { "max" } else { "min" }
+        ));
+    } else {
+        app.remote_reasoning_effort = Some(next_effort.to_string());
+        app.invalidate_model_picker_cache();
+        app.set_status_notice(format!(
+            "Effort: {} (will apply to next request)",
+            app_mod::effort_display_label(next_effort)
+        ));
+        remote.set_reasoning_effort(next_effort).await?;
+    }
+    Ok(())
+}
+
+fn remote_rewindable_messages(app: &App) -> Vec<&DisplayMessage> {
+    app.display_messages()
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .collect()
+}
+
+fn show_remote_rewind_history(app: &mut App) {
+    let rewindable = remote_rewindable_messages(app);
+    if rewindable.is_empty() {
+        app.push_display_message(DisplayMessage::system(
+            "No messages in conversation.".to_string(),
+        ));
+        return;
+    }
+
+    let mut history = String::from("**Conversation history:**\n\n");
+    for (i, msg) in rewindable.iter().enumerate() {
+        let role_str = match msg.role.as_str() {
+            "user" => "👤 User",
+            "assistant" => "🤖 Assistant",
+            _ => "💬 Message",
+        };
+        let preview = crate::util::truncate_str(&msg.content, 80);
+        history.push_str(&format!("  `{}` {} - {}\n", i + 1, role_str, preview));
+    }
+    history.push_str("\nUse `/rewind N` to rewind to message N (removes all messages after).");
+    history.push_str(" After rewinding, use `/rewind undo` to restore the removed messages.");
+    app.push_display_message(DisplayMessage::system(history));
+}
+
+async fn handle_remote_rewind_command(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+    trimmed: &str,
+) -> Result<bool> {
+    if trimmed == "/rewind" {
+        show_remote_rewind_history(app);
+        return Ok(true);
+    }
+
+    if trimmed == "/rewind undo" {
+        remote.rewind_undo().await?;
+        app.pending_remote_rewind_notice = Some(PendingRemoteRewindNotice {
+            undo: true,
+            message_index: None,
+            changed_messages: 0,
+        });
+        app.set_status_notice("Undoing rewind...");
+        return Ok(true);
+    }
+
+    let Some(num_str) = trimmed.strip_prefix("/rewind ") else {
+        return Ok(false);
+    };
+
+    let message_count = remote_rewindable_messages(app).len();
+    if message_count == 0 {
+        app.push_display_message(DisplayMessage::system(
+            "No messages in conversation.".to_string(),
+        ));
+        return Ok(true);
+    }
+
+    match num_str.trim().parse::<usize>() {
+        Ok(n) if n > 0 && n <= message_count => {
+            remote.rewind(n).await?;
+            app.pending_remote_rewind_notice = Some(PendingRemoteRewindNotice {
+                undo: false,
+                message_index: Some(n),
+                changed_messages: message_count - n,
+            });
+            app.set_status_notice(format!("Rewinding to message {}...", n));
+        }
+        Ok(n) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Invalid message number: {}. Valid range: 1-{}",
+                n, message_count
+            )));
+        }
+        Err(_) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Usage: `/rewind N` where N is a message number (1-{})",
+                message_count
+            )));
+        }
+    }
+
+    Ok(true)
 }
 
 impl App {
@@ -166,40 +300,17 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
     if let Some(direction) = app.effort_switch_keys.direction_for(code, modifiers) {
-        let efforts = ["none", "low", "medium", "high", "xhigh"];
-        let current = app.remote_reasoning_effort.as_deref();
-        let current_index = current
-            .and_then(|c| efforts.iter().position(|e| *e == c))
-            .unwrap_or(efforts.len() - 1);
-        let len = efforts.len();
-        let next_index = if direction > 0 {
-            if current_index + 1 >= len {
-                current_index
-            } else {
-                current_index + 1
-            }
-        } else if current_index == 0 {
-            0
-        } else {
-            current_index - 1
-        };
-        let next_effort = efforts[next_index];
-        if Some(next_effort) == current {
-            let label = app_mod::effort_display_label(next_effort);
-            app.set_status_notice(format!(
-                "Effort: {} (already at {})",
-                label,
-                if direction > 0 { "max" } else { "min" }
-            ));
-        } else {
-            app.remote_reasoning_effort = Some(next_effort.to_string());
-            app.invalidate_model_picker_cache();
-            app.set_status_notice(format!(
-                "Effort: {} (will apply to next request)",
-                app_mod::effort_display_label(next_effort)
-            ));
-            remote.set_reasoning_effort(next_effort).await?;
-        }
+        apply_remote_effort_direction(app, remote, direction).await?;
+        return Ok(());
+    }
+    if cfg!(target_os = "macos")
+        && app.input.is_empty()
+        && !matches!(app.status, ProcessingStatus::RunningTool(_))
+        && let Some(direction) = app
+            .effort_switch_keys
+            .macos_option_arrow_escape_direction_for(code, modifiers)
+    {
+        apply_remote_effort_direction(app, remote, direction).await?;
         return Ok(());
     }
     if modifiers.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char('s')) {
@@ -607,6 +718,10 @@ async fn handle_remote_key_internal(
                 }
 
                 if app_mod::commands::handle_dictation_command(app, trimmed) {
+                    return Ok(());
+                }
+
+                if handle_remote_rewind_command(app, remote, trimmed).await? {
                     return Ok(());
                 }
 
@@ -1503,96 +1618,6 @@ async fn handle_remote_key_internal(
                         "Requesting compaction...".to_string(),
                     ));
                     remote.compact().await?;
-                    return Ok(());
-                }
-
-                if trimmed == "/rewind" {
-                    remote.rewind(0).await?;
-                    return Ok(());
-                }
-
-                if trimmed == "/mcp" || trimmed == "/mcp list" {
-                    remote.mcp_control("list", None).await?;
-                    return Ok(());
-                }
-
-                if trimmed == "/mcp reload" {
-                    app.push_display_message(DisplayMessage::system(
-                        "Reloading MCP servers from config…".to_string(),
-                    ));
-                    remote.mcp_control("reload", None).await?;
-                    return Ok(());
-                }
-
-                if let Some(rest) = trimmed.strip_prefix("/mcp connect ") {
-                    let name = rest.trim();
-                    if name.is_empty() {
-                        app.push_display_message(DisplayMessage::error(
-                            "Usage: `/mcp connect <name>` (name must match an entry in `~/.jcode/mcp.json`)".to_string(),
-                        ));
-                    } else {
-                        app.push_display_message(DisplayMessage::system(format!(
-                            "Connecting MCP server `{name}`…"
-                        )));
-                        remote.mcp_control("connect", Some(name)).await?;
-                    }
-                    return Ok(());
-                }
-
-                if let Some(rest) = trimmed.strip_prefix("/mcp disconnect ") {
-                    let name = rest.trim();
-                    if name.is_empty() {
-                        app.push_display_message(DisplayMessage::error(
-                            "Usage: `/mcp disconnect <name>`".to_string(),
-                        ));
-                    } else {
-                        app.push_display_message(DisplayMessage::system(format!(
-                            "Disconnecting MCP server `{name}`…"
-                        )));
-                        remote.mcp_control("disconnect", Some(name)).await?;
-                    }
-                    return Ok(());
-                }
-
-                if trimmed.starts_with("/mcp ") || trimmed == "/mcp" {
-                    app.push_display_message(DisplayMessage::error(
-                        "Usage: `/mcp [list|reload|connect <name>|disconnect <name>]`".to_string(),
-                    ));
-                    return Ok(());
-                }
-
-                if let Some(num_str) = trimmed.strip_prefix("/rewind ") {
-                    let num_str = num_str.trim();
-                    match num_str.parse::<usize>() {
-                        Ok(n) if n > 0 => {
-                            app.push_display_message(DisplayMessage::system(format!(
-                                "Rewinding to message {n}…"
-                            )));
-                            remote.rewind(n).await?;
-                        }
-                        Ok(_) | Err(_) => {
-                            app.push_display_message(DisplayMessage::error(
-                                "Usage: `/rewind N` where N is a positive message number. Run `/rewind` to see the list."
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    return Ok(());
-                }
-
-                if let Some(rest) = trimmed.strip_prefix("/checkout ") {
-                    let target = rest.trim().trim_start_matches('@');
-                    if target.is_empty() {
-                        app.push_display_message(DisplayMessage::error(
-                            "Usage: `/checkout @<short-id>`. Run `/branches` to list leaves."
-                                .to_string(),
-                        ));
-                    } else {
-                        app.push_display_message(DisplayMessage::system(format!(
-                            "Switching to branch `@{target}`…"
-                        )));
-                        remote.checkout(target).await?;
-                    }
                     return Ok(());
                 }
 

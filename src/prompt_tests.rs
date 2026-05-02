@@ -8,11 +8,11 @@ fn test_default_system_prompt_no_claude_code_identity() {
 
     assert!(
         !prompt.contains("claude code"),
-        "DEFAULT_SYSTEM_PROMPT should NOT identify as 'Claude Code'. Found in system.txt"
+        "DEFAULT_SYSTEM_PROMPT should NOT identify as 'Claude Code'. Found in system_prompt.md"
     );
     assert!(
         !prompt.contains("claude-code"),
-        "DEFAULT_SYSTEM_PROMPT should NOT contain 'claude-code'. Found in system.txt"
+        "DEFAULT_SYSTEM_PROMPT should NOT contain 'claude-code'. Found in system_prompt.md"
     );
 }
 
@@ -24,7 +24,7 @@ fn test_skill_prompt_integration() {
     let prompt = build_system_prompt(Some(skill_prompt), &[]);
 
     // The prompt should contain our default system prompt
-    assert!(prompt.contains("You are the Jcode agent"));
+    assert!(prompt.contains("You are the Jcode Agent"));
 
     // The prompt should contain the skill prompt
     assert!(prompt.contains(skill_prompt));
@@ -68,10 +68,22 @@ fn test_load_agents_md_files_uses_sandboxed_global_files() {
 }
 
 #[test]
-fn test_dynamic_system_prompt_includes_time_and_timezone() {
+fn test_session_context_includes_time_timezone_and_system_info() {
+    let context = build_session_context(None);
+    assert!(context.contains("# Session Context"));
+    assert!(context.contains("Time: "));
+    assert!(context.contains("Timezone: UTC"));
+    assert!(context.contains("OS: "));
+    assert!(context.contains("Architecture: "));
+    assert!(context.contains("Jcode version: "));
+}
+
+#[test]
+fn test_split_prompt_does_not_inject_session_context_per_turn() {
     let (split, _info) = build_system_prompt_split(None, &[], false, None, None);
-    assert!(split.dynamic_part.contains("Time: "));
-    assert!(split.dynamic_part.contains("Timezone: UTC"));
+    assert!(!split.dynamic_part.contains("# Session Context"));
+    assert!(!split.dynamic_part.contains("Time: "));
+    assert!(!split.dynamic_part.contains("Timezone: UTC"));
 }
 
 #[test]

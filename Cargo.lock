@@ -2526,7 +2526,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jcode"
-version = "0.10.3"
+version = "0.11.4"
 dependencies = [
  "agentgrep",
  "anyhow",
@@ -2547,33 +2547,49 @@ dependencies = [
  "ignore",
  "image",
  "jcode-agent-runtime",
+ "jcode-ambient-types",
+ "jcode-auth-types",
  "jcode-azure-auth",
+ "jcode-background-types",
+ "jcode-batch-types",
+ "jcode-config-types",
+ "jcode-core",
  "jcode-embedding",
+ "jcode-gateway-types",
+ "jcode-memory-types",
+ "jcode-message-types",
  "jcode-notify-email",
  "jcode-pdf",
+ "jcode-plan",
+ "jcode-protocol",
  "jcode-provider-core",
  "jcode-provider-gemini",
  "jcode-provider-metadata",
  "jcode-provider-openrouter",
+ "jcode-selfdev-types",
+ "jcode-session-types",
+ "jcode-side-panel-types",
+ "jcode-task-types",
+ "jcode-terminal-launch",
+ "jcode-tui-core",
+ "jcode-tui-markdown",
+ "jcode-tui-mermaid",
+ "jcode-tui-render",
  "jcode-tui-workspace",
+ "jcode-usage-types",
  "libc",
- "mermaid-rs-renderer",
  "open",
  "proctitle",
- "pulldown-cmark",
  "qr2term",
  "rand 0.9.3",
  "ratatui",
- "ratatui-image",
  "regex",
  "reqwest",
- "resvg",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
  "similar",
- "syntect",
  "tar",
  "tempfile",
  "thiserror 1.0.69",
@@ -2587,7 +2603,6 @@ dependencies = [
  "unicode-width 0.2.0",
  "url",
  "urlencoding",
- "usvg",
  "uuid",
  "walkdir",
  "windows-sys 0.59.0",
@@ -2602,12 +2617,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcode-ambient-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+]
+
+[[package]]
+name = "jcode-auth-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "jcode-azure-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "azure_core",
  "azure_identity",
+]
+
+[[package]]
+name = "jcode-background-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "jcode-batch-types"
+version = "0.1.0"
+dependencies = [
+ "jcode-message-types",
+ "serde",
+]
+
+[[package]]
+name = "jcode-config-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "jcode-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "rand 0.9.3",
+ "serde",
 ]
 
 [[package]]
@@ -2637,6 +2699,25 @@ dependencies = [
  "tokenizers",
  "tract-hir",
  "tract-onnx",
+]
+
+[[package]]
+name = "jcode-gateway-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "jcode-memory-types"
+version = "0.1.0"
+
+[[package]]
+name = "jcode-message-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2689,6 +2770,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcode-plan"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "jcode-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jcode-batch-types",
+ "jcode-config-types",
+ "jcode-message-types",
+ "jcode-plan",
+ "jcode-provider-core",
+ "jcode-selfdev-types",
+ "jcode-session-types",
+ "jcode-side-panel-types",
+ "rand 0.9.3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jcode-provider-core"
 version = "0.1.0"
 dependencies = [
@@ -2723,10 +2829,106 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcode-selfdev-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+]
+
+[[package]]
+name = "jcode-session-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "jcode-message-types",
+ "serde",
+]
+
+[[package]]
+name = "jcode-side-panel-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "jcode-task-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+]
+
+[[package]]
+name = "jcode-terminal-launch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+]
+
+[[package]]
+name = "jcode-tui-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "jcode-tui-markdown"
+version = "0.1.0"
+dependencies = [
+ "jcode-tui-mermaid",
+ "jcode-tui-workspace",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "syntect",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "jcode-tui-mermaid"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "crossterm 0.28.1",
+ "dirs",
+ "image",
+ "jcode-tui-workspace",
+ "mermaid-rs-renderer",
+ "ratatui",
+ "ratatui-image",
+ "resvg",
+ "serde",
+ "serde_json",
+ "usvg",
+]
+
+[[package]]
+name = "jcode-tui-render"
+version = "0.1.0"
+dependencies = [
+ "ratatui",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
 name = "jcode-tui-workspace"
 version = "0.1.0"
 dependencies = [
  "ratatui",
+]
+
+[[package]]
+name = "jcode-usage-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

@@ -73,7 +73,7 @@ pub(crate) fn set_client_remote_display_title(
 
 pub(crate) fn initial_title(args: &Args) -> String {
     match &args.command {
-        Some(Command::Serve) => "jcode:server".to_string(),
+        Some(Command::Serve { .. }) => "jcode:server".to_string(),
         Some(Command::Connect) => "jcode:client".to_string(),
         Some(Command::Run { .. }) => "jcode run".to_string(),
         Some(Command::Login { .. }) => "jcode login".to_string(),

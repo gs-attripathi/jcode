@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Default system prompt for jcode (embedded at compile time)
-pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("prompt/system.txt");
+pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("prompt/system_prompt.md");
 const SELFDEV_HINT_PROMPT: &str = include_str!("prompt/selfdev_hint.txt");
 const SELFDEV_MODE_PROMPT: &str = include_str!("prompt/selfdev_mode.txt");
 
@@ -14,7 +14,7 @@ const SELFDEV_MODE_PROMPT: &str = include_str!("prompt/selfdev_mode.txt");
 pub struct SplitSystemPrompt {
     /// Static content that should be cached (instruction files, base prompt, skills)
     pub static_part: String,
-    /// Dynamic content that changes frequently (date, git status, memory)
+    /// Dynamic turn context that changes per request (memory, active skill, reminders)
     pub dynamic_part: String,
 }
 
@@ -51,8 +51,8 @@ pub struct ContextInfo {
     // === Static (System Prompt) ===
     /// Base system prompt size (chars)
     pub system_prompt_chars: usize,
-    /// Environment context size (chars)
-    pub env_context_chars: usize,
+    /// Immutable session context size (chars), when persisted in transcript history.
+    pub session_context_chars: usize,
     /// Whether project AGENTS.md was loaded
     pub has_project_agents_md: bool,
     /// Project AGENTS.md size (chars)
@@ -104,7 +104,7 @@ impl ContextInfo {
 
     pub fn prompt_prefix_chars(&self) -> usize {
         self.system_prompt_chars
-            + self.env_context_chars
+            + self.session_context_chars
             + self.project_agents_md_chars
             + self.global_agents_md_chars
             + self.skills_chars
@@ -126,7 +126,7 @@ impl ContextInfo {
     pub fn breakdown(&self) -> Vec<(&'static str, usize, &'static str)> {
         let mut parts = vec![
             ("sys", self.system_prompt_chars, "⚙"),
-            ("env", self.env_context_chars, "🌍"),
+            ("session", self.session_context_chars, "🌍"),
         ];
         if self.has_project_agents_md {
             parts.push(("agents", self.project_agents_md_chars, "📋"));
@@ -150,7 +150,7 @@ impl ContextInfo {
     }
 }
 
-/// Build the full system prompt with dynamic context
+/// Build the full system prompt with static context.
 pub fn build_system_prompt(skill_prompt: Option<&str>, available_skills: &[SkillInfo]) -> String {
     build_system_prompt_with_selfdev(skill_prompt, available_skills, false)
 }
@@ -204,12 +204,6 @@ pub fn build_system_prompt_full(
         ..Default::default()
     };
 
-    // Add environment context
-    if let Some(env_context) = build_env_context() {
-        info.env_context_chars = env_context.len();
-        parts.push(env_context);
-    }
-
     // Add self-dev guidance. Full workflow instructions are only included for
     // active self-dev sessions; other sessions get a lightweight hint.
     if is_selfdev {
@@ -255,10 +249,6 @@ pub fn build_system_prompt_full(
         info.skills_chars = skills_section.len();
         parts.push(skills_section);
     }
-
-    parts.push(
-        "# Persistent Goals\n\nThe user may have persistent long-term goals that live outside the current conversation. Use the `goal` tool to list, resume, inspect, create, or update goals when relevant. Do not assume the current session is about a goal unless the user asks for it or the context strongly suggests it. Goal details are not preloaded into context; retrieve them on demand. The user can also inspect goals manually with `/goals`.".to_string(),
-    );
 
     // Add active skill prompt
     if let Some(skill) = skill_prompt {
@@ -329,17 +319,7 @@ pub fn build_system_prompt_split(
         static_parts.push(skills_section);
     }
 
-    static_parts.push(
-        "# Persistent Goals\n\nThe user may have persistent long-term goals that live outside the current conversation. Use the `goal` tool to list, resume, inspect, create, or update goals when relevant. Do not assume the current session is about a goal unless the user asks for it or the context strongly suggests it. Goal details are not preloaded into context; retrieve them on demand. The user can also inspect goals manually with `/goals`.".to_string(),
-    );
-
-    // === DYNAMIC CONTENT (not cached) ===
-
-    // Environment context (date, cwd, git status) - changes frequently
-    if let Some(env_context) = build_env_context() {
-        info.env_context_chars = env_context.len();
-        dynamic_parts.push(env_context);
-    }
+    // === TURN CONTEXT (not cached) ===
 
     // Memory prompt (changes per conversation)
     if let Some(memory) = memory_prompt {
@@ -380,33 +360,48 @@ fn build_selfdev_prompt() -> String {
     SELFDEV_MODE_PROMPT.to_string()
 }
 
-/// Build environment context (date, cwd, git status)
-fn build_env_context() -> Option<String> {
-    let mut lines = vec!["# Environment".to_string()];
+/// Build immutable session context captured once per session.
+pub fn build_session_context(working_dir: Option<&Path>) -> String {
+    let mut lines = vec!["# Session Context".to_string()];
 
-    // Current time reference for model-visible timestamps.
     let now_utc = chrono::Utc::now();
     lines.push(format!("Date: {}", now_utc.format("%Y-%m-%d")));
     lines.push(format!("Time: {} UTC", now_utc.format("%H:%M:%S")));
     lines.push("Timezone: UTC".to_string());
+    lines.push(format!("OS: {}", std::env::consts::OS));
+    lines.push(format!("Architecture: {}", std::env::consts::ARCH));
+    lines.push(format!(
+        "Jcode version: {} ({})",
+        env!("JCODE_VERSION"),
+        env!("JCODE_GIT_HASH")
+    ));
 
-    // Working directory
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Some(hardware) = hardware_context() {
+        lines.push(hardware);
+    }
+
+    let cwd = working_dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    if let Some(cwd) = cwd.as_ref() {
         lines.push(format!("Working directory: {}", cwd.display()));
     }
 
-    // Git info
-    if let Some(git_info) = get_git_info() {
+    if let Some(git_info) = get_git_info(cwd.as_deref()) {
         lines.push(git_info);
     }
 
-    Some(lines.join("\n"))
+    lines.join("\n")
 }
 
 /// Get git branch and status summary
-fn get_git_info() -> Option<String> {
+fn get_git_info(working_dir: Option<&Path>) -> Option<String> {
+    let mut command = Command::new("git");
+    if let Some(dir) = working_dir {
+        command.current_dir(dir);
+    }
     // Check if we're in a git repo
-    let in_repo = Command::new("git")
+    let in_repo = command
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .ok()
@@ -420,9 +415,11 @@ fn get_git_info() -> Option<String> {
     let mut info = vec!["Git:".to_string()];
 
     // Current branch
-    if let Ok(output) = Command::new("git")
-        .args(["branch", "--show-current"])
-        .output()
+    let mut branch_command = Command::new("git");
+    if let Some(dir) = working_dir {
+        branch_command.current_dir(dir);
+    }
+    if let Ok(output) = branch_command.args(["branch", "--show-current"]).output()
         && output.status.success()
     {
         let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -432,7 +429,11 @@ fn get_git_info() -> Option<String> {
     }
 
     // Short status (modified files count)
-    if let Ok(output) = Command::new("git").args(["status", "--porcelain"]).output()
+    let mut status_command = Command::new("git");
+    if let Some(dir) = working_dir {
+        status_command.current_dir(dir);
+    }
+    if let Ok(output) = status_command.args(["status", "--porcelain"]).output()
         && output.status.success()
     {
         let status = String::from_utf8_lossy(&output.stdout);
@@ -452,6 +453,103 @@ fn get_git_info() -> Option<String> {
         Some(info.join("\n"))
     } else {
         None
+    }
+}
+
+fn hardware_context() -> Option<String> {
+    let mut lines = Vec::new();
+
+    if let Some(machine) = machine_model() {
+        lines.push(format!("  Machine: {}", machine));
+    }
+    if let Some(cpu) = cpu_model() {
+        lines.push(format!("  CPU: {}", cpu));
+    }
+    if let Some(gpu) = gpu_summary() {
+        lines.push(format!("  GPU: {}", gpu));
+    }
+    if let Some(memory) = memory_summary() {
+        lines.push(format!("  Memory: {}", memory));
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        let mut out = vec!["Hardware:".to_string()];
+        out.extend(lines);
+        Some(out.join("\n"))
+    }
+}
+
+fn read_trimmed_file(path: impl Into<PathBuf>) -> Option<String> {
+    std::fs::read_to_string(path.into())
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn machine_model() -> Option<String> {
+    let vendor = read_trimmed_file("/sys/devices/virtual/dmi/id/sys_vendor");
+    let product = read_trimmed_file("/sys/devices/virtual/dmi/id/product_name");
+    match (vendor, product) {
+        (Some(vendor), Some(product)) if product.contains(&vendor) => Some(product),
+        (Some(vendor), Some(product)) => Some(format!("{} {}", vendor, product)),
+        (None, Some(product)) => Some(product),
+        (Some(vendor), None) => Some(vendor),
+        (None, None) => None,
+    }
+}
+
+fn cpu_model() -> Option<String> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    cpuinfo.lines().find_map(|line| {
+        let (_, value) = line.split_once(':')?;
+        if line.trim_start().starts_with("model name") {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        } else {
+            None
+        }
+    })
+}
+
+fn memory_summary() -> Option<String> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemTotal:")?.trim();
+        rest.split_whitespace().next()?.parse::<u64>().ok()
+    })?;
+    let gib = kb as f64 / 1024.0 / 1024.0;
+    Some(format!("{:.1} GiB", gib))
+}
+
+fn gpu_summary() -> Option<String> {
+    let output = Command::new("lspci").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut gpus: Vec<String> = text
+        .lines()
+        .filter(|line| {
+            line.contains(" VGA compatible controller")
+                || line.contains(" 3D controller")
+                || line.contains(" Display controller")
+        })
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(_, rest)| rest.trim().to_string())
+        })
+        .collect();
+    gpus.dedup();
+    if gpus.is_empty() {
+        None
+    } else {
+        Some(gpus.join("; "))
     }
 }
 
@@ -484,34 +582,14 @@ pub fn load_agents_md_files_from_dir(working_dir: Option<&Path>) -> (Option<Stri
         contents.push(content);
     }
 
-    // Global instructions: prefer a jcode-specific file at
-    // `$JCODE_HOME/AGENTS.md` (default `~/.jcode/AGENTS.md`) so users can
-    // keep separate global instructions for jcode vs other AGENTS.md-aware
-    // tools (e.g. Claude Code reads `~/.claude/CLAUDE.md`, jcode reads
-    // `~/AGENTS.md` — sharing them tends to leak Claude-Code-specific
-    // tool names like ToolSearch / mcp__context7 into jcode's prompt and
-    // confuse the agent). Falls back to `~/AGENTS.md` if no
-    // jcode-specific file exists, preserving prior behavior.
-    let jcode_dir_agents_md = crate::storage::jcode_dir()
-        .ok()
-        .map(|d| d.join("AGENTS.md"));
-    let home_agents_md = crate::storage::user_home_path("AGENTS.md").ok();
-    let candidates: Vec<PathBuf> = jcode_dir_agents_md
-        .into_iter()
-        .chain(home_agents_md)
-        .collect();
-    for path in candidates {
-        let label = if path.starts_with(crate::storage::jcode_dir().unwrap_or_default()) {
-            "Global Instructions ($JCODE_HOME/AGENTS.md)"
-        } else {
-            "Global Instructions (~/AGENTS.md)"
-        };
-        if let Some((content, size)) = load_file(&path, label) {
-            info.has_global_agents_md = true;
-            info.global_agents_md_chars = size;
-            contents.push(content);
-            break; // first hit wins; jcode-specific overrides shared
-        }
+    // Home directory files
+    if let Ok(global_agents_md) = crate::storage::user_home_path("AGENTS.md")
+        && let Some((content, size)) =
+            load_file(&global_agents_md, "Global Instructions (~/.AGENTS.md)")
+    {
+        info.has_global_agents_md = true;
+        info.global_agents_md_chars = size;
+        contents.push(content);
     }
 
     if contents.is_empty() {

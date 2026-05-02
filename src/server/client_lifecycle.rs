@@ -1,9 +1,7 @@
 use super::client_actions::{
-    AgentTaskContext, NotifySessionContext, handle_agent_task, handle_checkout, handle_compact,
-    handle_input_shell, handle_mcp_control, handle_notify_session, handle_rewind,
-    handle_run_subagent,
-    handle_set_feature, handle_set_subagent_model, handle_split, handle_stdin_response,
-    handle_transfer, handle_trigger_memory_extraction,
+    AgentTaskContext, NotifySessionContext, handle_agent_task, handle_compact, handle_input_shell,
+    handle_notify_session, handle_run_subagent, handle_set_feature, handle_set_subagent_model,
+    handle_split, handle_stdin_response, handle_transfer, handle_trigger_memory_extraction,
 };
 use super::client_comm::{
     handle_comm_channel_members, handle_comm_list, handle_comm_list_channels, handle_comm_message,
@@ -33,12 +31,13 @@ use super::provider_control::{
     handle_set_compaction_mode, handle_set_model, handle_set_premium_mode,
     handle_set_reasoning_effort, handle_set_service_tier, handle_set_transport,
     handle_switch_anthropic_account, handle_switch_openai_account,
+    try_available_models_updated_event,
 };
 use super::{
-    AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileAccess,
+    AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileAccess, SessionControlHandle,
     SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember, SwarmMutationRuntime,
-    VersionedPlan, enqueue_soft_interrupt, register_session_interrupt_queue, truncate_detail,
-    update_member_status,
+    VersionedPlan, format_structured_completion_report, register_session_interrupt_queue,
+    truncate_detail, update_member_status, update_member_status_with_report,
 };
 use crate::agent::Agent;
 use crate::bus::{Bus, BusEvent};
@@ -49,8 +48,7 @@ use crate::tool::Registry;
 use crate::transport::Stream;
 use anyhow::Result;
 use futures::FutureExt;
-use jcode_agent_runtime::{InterruptSignal, SoftInterruptQueue, SoftInterruptSource, StreamError};
-use serde_json;
+use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource, StreamError};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -109,6 +107,7 @@ fn is_lightweight_control_request(request: &Request) -> bool {
             | Request::CommAssignRole { .. }
             | Request::CommSummary { .. }
             | Request::CommStatus { .. }
+            | Request::CommReport { .. }
             | Request::CommPlanStatus { .. }
             | Request::CommReadContext { .. }
             | Request::CommResyncPlan { .. }
@@ -398,11 +397,13 @@ async fn handle_lightweight_control_request(
             id,
             session_id: req_session_id,
             target_session,
+            force,
         } => {
             handle_comm_stop(
                 id,
                 req_session_id,
                 target_session,
+                force.unwrap_or(false),
                 &client_event_tx,
                 sessions,
                 swarm_members,
@@ -476,6 +477,40 @@ async fn handle_lightweight_control_request(
                 &client_event_tx,
             )
             .await;
+        }
+        Request::CommReport {
+            id,
+            session_id: req_session_id,
+            status,
+            message,
+            validation,
+            follow_up,
+        } => {
+            let status = status.unwrap_or_else(|| "ready".to_string());
+            let report = format_structured_completion_report(
+                &message,
+                validation.as_deref(),
+                follow_up.as_deref(),
+            );
+            let detail = Some(truncate_detail(&message, 160));
+            update_member_status_with_report(
+                &req_session_id,
+                &status,
+                detail,
+                Some(report.clone()),
+                swarm_members,
+                swarms_by_id,
+                Some(event_history),
+                Some(event_counter),
+                Some(swarm_event_tx),
+            )
+            .await;
+            let _ = client_event_tx.send(ServerEvent::CommReportResponse {
+                id,
+                status,
+                message: "Report recorded and delivered to the coordinator when applicable."
+                    .to_string(),
+            });
         }
         Request::CommPlanStatus {
             id,
@@ -557,6 +592,7 @@ async fn handle_lightweight_control_request(
             id,
             session_id: req_session_id,
             target_session,
+            working_dir,
             prefer_spawn,
             spawn_if_needed,
             message,
@@ -565,6 +601,7 @@ async fn handle_lightweight_control_request(
                 id,
                 req_session_id,
                 target_session,
+                working_dir,
                 prefer_spawn,
                 spawn_if_needed,
                 message,
@@ -693,11 +730,13 @@ async fn handle_lightweight_control_request(
     Ok(())
 }
 
-async fn refresh_runtime_handles(
+async fn refresh_session_control_handle(
+    session_id: &str,
     agent: &Arc<Mutex<Agent>>,
-) -> (SoftInterruptQueue, InterruptSignal, InterruptSignal) {
+) -> SessionControlHandle {
     let agent_guard = agent.lock().await;
-    (
+    SessionControlHandle::new(
+        session_id,
         agent_guard.soft_interrupt_queue(),
         agent_guard.background_tool_signal(),
         agent_guard.graceful_shutdown_signal(),
@@ -811,7 +850,7 @@ pub(super) async fn handle_client(
     // Per-client state
     let mut client_is_processing = false;
     let (processing_done_tx, mut processing_done_rx) =
-        mpsc::unbounded_channel::<(u64, Result<()>)>();
+        mpsc::unbounded_channel::<(u64, Result<()>, Option<String>)>();
     let mut processing_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut processing_message_id: Option<u64> = None;
     let mut processing_session_id: Option<String> = None;
@@ -826,7 +865,7 @@ pub(super) async fn handle_client(
     let registry_ms = t0.elapsed().as_millis();
 
     let mut swarm_enabled = crate::config::config().features.swarm;
-    let mut last_available_models_snapshot: Option<(Vec<String>, String)> = None;
+    let mut last_available_models_snapshot: Option<String> = None;
     const MAX_LIVE_AVAILABLE_MODELS_UPDATE_BYTES: usize = 64 * 1024;
 
     // Create a new session for this client
@@ -871,28 +910,28 @@ pub(super) async fn handle_client(
         }
     }
 
-    // Get a handle to the soft interrupt queue BEFORE wrapping in Mutex
-    // This allows queueing interrupts while the agent is processing
-    let mut soft_interrupt_queue = new_agent.soft_interrupt_queue();
-
-    // Get a handle to the background tool signal BEFORE wrapping in Mutex
-    // This allows signaling "move to background" while the agent is processing
-    let mut background_tool_signal = new_agent.background_tool_signal();
-
-    // Get a handle to the graceful shutdown signal BEFORE wrapping in Mutex
-    // This allows signaling cancel (checkpoint partial response) without needing the lock
-    let mut cancel_signal = new_agent.graceful_shutdown_signal();
+    // Get lock-free control-plane handles BEFORE wrapping in Mutex.
+    // This allows cancel/soft-interrupt/background-tool requests while the agent is processing.
+    let mut session_control = SessionControlHandle::new(
+        client_session_id.clone(),
+        new_agent.soft_interrupt_queue(),
+        new_agent.background_tool_signal(),
+        new_agent.graceful_shutdown_signal(),
+    );
 
     // Register the shutdown signal in the server-level map so
     // graceful_shutdown_sessions can signal it without locking the agent mutex
     {
         let mut signals = shutdown_signals.write().await;
-        signals.insert(client_session_id.clone(), cancel_signal.clone());
+        signals.insert(
+            client_session_id.clone(),
+            session_control.stop_current_turn_signal(),
+        );
     }
     register_session_interrupt_queue(
         &soft_interrupt_queues,
         &client_session_id,
-        soft_interrupt_queue.clone(),
+        new_agent.soft_interrupt_queue(),
     )
     .await;
 
@@ -1039,7 +1078,7 @@ pub(super) async fn handle_client(
                 }
             }
             done = processing_done_rx.recv() => {
-                if let Some((done_id, result)) = done {
+                if let Some((done_id, result, completion_report)) = done {
                     if Some(done_id) != processing_message_id {
                         crate::logging::warn(&format!(
                             "Done event id={} doesn't match processing_message_id={:?}, dropping",
@@ -1067,10 +1106,11 @@ pub(super) async fn handle_client(
                     match result {
                         Ok(()) => {
                             if let Some(session_id) = done_session.as_deref() {
-                                update_member_status(
+                                update_member_status_with_report(
                                     session_id,
                                     "ready",
                                     None,
+                                    completion_report,
                                     &swarm_members,
                                     &swarms_by_id,
                                     Some(&event_history),
@@ -1132,41 +1172,28 @@ pub(super) async fn handle_client(
             bus_event = bus_rx.recv(), if client_subscribed => {
                 match bus_event {
                     Ok(BusEvent::ModelsUpdated) => {
-                        let (models, model_routes) = if let Ok(agent_guard) = agent.try_lock() {
-                            (
-                                agent_guard.available_models_display(),
-                                agent_guard.model_routes(),
-                            )
-                        } else {
+                        let Some(event) = try_available_models_updated_event(&agent) else {
                             crate::logging::info(&format!(
                                 "Skipping ModelsUpdated push for busy connection {}",
                                 client_connection_id
                             ));
                             continue;
                         };
-                        let routes_json = serde_json::to_string(&model_routes).unwrap_or_default();
-                        if last_available_models_snapshot
-                            .as_ref()
-                            .map(|(prev_models, prev_routes)| prev_models == &models && prev_routes == &routes_json)
-                            .unwrap_or(false)
-                        {
+                        let encoded_event = crate::protocol::encode_event(&event);
+                        if last_available_models_snapshot.as_ref() == Some(&encoded_event) {
                             continue;
                         }
-                        let event = ServerEvent::AvailableModelsUpdated {
-                            available_models: models.clone(),
-                            available_model_routes: model_routes,
-                        };
-                        let encoded_len = crate::protocol::encode_event(&event).len();
+                        let encoded_len = encoded_event.len();
                         if encoded_len > MAX_LIVE_AVAILABLE_MODELS_UPDATE_BYTES {
                             crate::logging::warn(&format!(
                                 "Skipping oversized bus AvailableModelsUpdated frame for connection {} ({} bytes)",
                                 client_connection_id, encoded_len
                             ));
-                            last_available_models_snapshot = Some((models, routes_json));
+                            last_available_models_snapshot = Some(encoded_event);
                             continue;
                         }
                         let _ = client_event_tx.send(event);
-                        last_available_models_snapshot = Some((models, routes_json));
+                        last_available_models_snapshot = Some(encoded_event);
                     }
                     Ok(BusEvent::BatchProgress(progress)) => {
                         if progress.session_id == client_session_id {
@@ -1282,7 +1309,7 @@ pub(super) async fn handle_client(
                         session_id: &mut processing_session_id,
                         task: &mut processing_task,
                     },
-                    &cancel_signal,
+                    &session_control,
                     &client_event_tx,
                     &SwarmStatusRefs {
                         members: &swarm_members,
@@ -1312,22 +1339,17 @@ pub(super) async fn handle_client(
                     content,
                     urgent,
                     SoftInterruptSource::User,
-                    &soft_interrupt_queue,
+                    &session_control,
                     &client_event_tx,
                 );
             }
 
             Request::CancelSoftInterrupts { id } => {
-                clear_soft_interrupts(
-                    id,
-                    &client_session_id,
-                    &soft_interrupt_queue,
-                    &client_event_tx,
-                );
+                clear_soft_interrupts(id, &client_session_id, &session_control, &client_event_tx);
             }
 
             Request::BackgroundTool { id } => {
-                move_tool_to_background(id, &background_tool_signal, &client_event_tx);
+                move_tool_to_background(id, &session_control, &client_event_tx);
             }
 
             Request::Clear { id } => {
@@ -1356,8 +1378,109 @@ pub(super) async fn handle_client(
                     &client_event_tx,
                 )
                 .await;
-                (soft_interrupt_queue, background_tool_signal, cancel_signal) =
-                    refresh_runtime_handles(&agent).await;
+                session_control = refresh_session_control_handle(&client_session_id, &agent).await;
+            }
+
+            Request::Rewind { id, message_index } => {
+                if client_is_processing {
+                    let _ = client_event_tx.send(ServerEvent::Error {
+                        id,
+                        message: "Cannot rewind while a turn is processing.".to_string(),
+                        retry_after_secs: None,
+                    });
+                    continue;
+                }
+
+                let rewind_result = {
+                    let mut agent_guard = agent.lock().await;
+                    agent_guard.rewind_to_message(message_index)
+                };
+
+                match rewind_result {
+                    Ok(removed) => {
+                        crate::logging::info(&format!(
+                            "Rewound session {} to message {} (removed {})",
+                            client_session_id, message_index, removed
+                        ));
+                        if handle_get_history(
+                            id,
+                            &client_session_id,
+                            client_is_processing,
+                            &agent,
+                            &provider,
+                            &sessions,
+                            &client_connections,
+                            &client_count,
+                            &writer,
+                            &server_name,
+                            &server_icon,
+                            None,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(message) => {
+                        let _ = client_event_tx.send(ServerEvent::Error {
+                            id,
+                            message,
+                            retry_after_secs: None,
+                        });
+                    }
+                }
+            }
+
+            Request::RewindUndo { id } => {
+                if client_is_processing {
+                    let _ = client_event_tx.send(ServerEvent::Error {
+                        id,
+                        message: "Cannot undo rewind while a turn is processing.".to_string(),
+                        retry_after_secs: None,
+                    });
+                    continue;
+                }
+
+                let undo_result = {
+                    let mut agent_guard = agent.lock().await;
+                    agent_guard.undo_rewind()
+                };
+
+                match undo_result {
+                    Ok(restored) => {
+                        crate::logging::info(&format!(
+                            "Undid rewind for session {} (restored {})",
+                            client_session_id, restored
+                        ));
+                        if handle_get_history(
+                            id,
+                            &client_session_id,
+                            client_is_processing,
+                            &agent,
+                            &provider,
+                            &sessions,
+                            &client_connections,
+                            &client_count,
+                            &writer,
+                            &server_name,
+                            &server_icon,
+                            None,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(message) => {
+                        let _ = client_event_tx.send(ServerEvent::Error {
+                            id,
+                            message,
+                            retry_after_secs: None,
+                        });
+                    }
+                }
             }
 
             Request::Ping { id } => {
@@ -1437,8 +1560,8 @@ pub(super) async fn handle_client(
                             &swarm_event_tx,
                         )
                         .await?;
-                        (soft_interrupt_queue, background_tool_signal, cancel_signal) =
-                            refresh_runtime_handles(&agent).await;
+                        session_control =
+                            refresh_session_control_handle(&client_session_id, &agent).await;
                         if client_session_id == target_session_id {
                             handle_subscribe(
                                 id,
@@ -1639,8 +1762,7 @@ pub(super) async fn handle_client(
                     &swarm_event_tx,
                 )
                 .await?;
-                (soft_interrupt_queue, background_tool_signal, cancel_signal) =
-                    refresh_runtime_handles(&agent).await;
+                session_control = refresh_session_control_handle(&client_session_id, &agent).await;
                 if let Some(snapshot) = try_available_models_snapshot(&agent) {
                     last_available_models_snapshot = Some(snapshot);
                 }
@@ -1701,7 +1823,15 @@ pub(super) async fn handle_client(
             }
 
             Request::NotifyAuthChanged { id } => {
-                handle_notify_auth_changed(id, &provider, &agent, &client_event_tx).await;
+                handle_notify_auth_changed(
+                    id,
+                    &provider,
+                    &provider_template,
+                    &sessions,
+                    &agent,
+                    &client_event_tx,
+                )
+                .await;
             }
 
             Request::SwitchAnthropicAccount { id, label } => {
@@ -1746,18 +1876,6 @@ pub(super) async fn handle_client(
 
             Request::Compact { id } => {
                 handle_compact(id, &agent, &client_event_tx);
-            }
-
-            Request::Rewind { id, n } => {
-                handle_rewind(id, n, &agent, &client_event_tx);
-            }
-
-            Request::Checkout { id, target } => {
-                handle_checkout(id, target, &agent, &client_event_tx);
-            }
-
-            Request::McpControl { id, action, server } => {
-                handle_mcp_control(id, action, server, &agent, &client_event_tx);
             }
 
             Request::TriggerMemoryExtraction { id } => {
@@ -2087,11 +2205,13 @@ pub(super) async fn handle_client(
                 id,
                 session_id: req_session_id,
                 target_session,
+                force,
             } => {
                 handle_comm_stop(
                     id,
                     req_session_id,
                     target_session,
+                    force.unwrap_or(false),
                     &client_event_tx,
                     &sessions,
                     &swarm_members,
@@ -2168,6 +2288,41 @@ pub(super) async fn handle_client(
                     &client_event_tx,
                 )
                 .await;
+            }
+
+            Request::CommReport {
+                id,
+                session_id: req_session_id,
+                status,
+                message,
+                validation,
+                follow_up,
+            } => {
+                let status = status.unwrap_or_else(|| "ready".to_string());
+                let report = format_structured_completion_report(
+                    &message,
+                    validation.as_deref(),
+                    follow_up.as_deref(),
+                );
+                let detail = Some(truncate_detail(&message, 160));
+                update_member_status_with_report(
+                    &req_session_id,
+                    &status,
+                    detail,
+                    Some(report),
+                    &swarm_members,
+                    &swarms_by_id,
+                    Some(&event_history),
+                    Some(&event_counter),
+                    Some(&swarm_event_tx),
+                )
+                .await;
+                let _ = client_event_tx.send(ServerEvent::CommReportResponse {
+                    id,
+                    status,
+                    message: "Report recorded and delivered to the coordinator when applicable."
+                        .to_string(),
+                });
             }
 
             Request::CommPlanStatus {
@@ -2254,6 +2409,7 @@ pub(super) async fn handle_client(
                 id,
                 session_id: req_session_id,
                 target_session,
+                working_dir,
                 prefer_spawn,
                 spawn_if_needed,
                 message,
@@ -2262,6 +2418,7 @@ pub(super) async fn handle_client(
                     id,
                     req_session_id,
                     target_session,
+                    working_dir,
                     prefer_spawn,
                     spawn_if_needed,
                     message,
@@ -2425,7 +2582,7 @@ async fn start_processing_message(
     state: &mut ProcessingState<'_>,
     agent: &Arc<Mutex<Agent>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
-    processing_done_tx: &mpsc::UnboundedSender<(u64, Result<()>)>,
+    processing_done_tx: &mpsc::UnboundedSender<(u64, Result<()>, Option<String>)>,
     swarm: &SwarmStatusRefs<'_>,
 ) {
     let ProcessingMessage {
@@ -2468,7 +2625,12 @@ async fn start_processing_message(
     )
     .await;
 
+    let start_message_index = {
+        let agent_guard = agent.lock().await;
+        agent_guard.message_count()
+    };
     let agent = Arc::clone(agent);
+    let report_agent = Arc::clone(&agent);
     let tx = client_event_tx.clone();
     let done_tx = processing_done_tx.clone();
     crate::logging::info(&format!("Processing message id={} spawning task", id));
@@ -2510,13 +2672,19 @@ async fn start_processing_message(
                 id, error
             )),
         }
-        let _ = done_tx.send((id, result));
+        let completion_report = if result.is_ok() {
+            let agent = report_agent.lock().await;
+            agent.latest_assistant_text_after(start_message_index)
+        } else {
+            None
+        };
+        let _ = done_tx.send((id, result, completion_report));
     }));
 }
 
 async fn cancel_processing_message(
     state: &mut ProcessingState<'_>,
-    cancel_signal: &InterruptSignal,
+    session_control: &SessionControlHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
     swarm: &SwarmStatusRefs<'_>,
 ) {
@@ -2525,7 +2693,7 @@ async fn cancel_processing_message(
             *state.task = Some(handle);
             return;
         }
-        cancel_signal.fire();
+        session_control.request_cancel();
         match tokio::time::timeout(std::time::Duration::from_millis(500), &mut handle).await {
             Ok(_) => {}
             Err(_) => {
@@ -2538,7 +2706,7 @@ async fn cancel_processing_message(
                 }
             }
         }
-        cancel_signal.reset();
+        session_control.reset_cancel();
         *state.task = None;
         *state.client_is_processing = false;
         if let Some(session_id) = state.session_id.take() {
@@ -2561,13 +2729,9 @@ async fn cancel_processing_message(
     }
 }
 
-fn try_available_models_snapshot(agent: &Arc<Mutex<Agent>>) -> Option<(Vec<String>, String)> {
-    let Ok(agent_guard) = agent.try_lock() else {
-        return None;
-    };
-    let models = agent_guard.available_models_display();
-    let routes_json = serde_json::to_string(&agent_guard.model_routes()).unwrap_or_default();
-    Some((models, routes_json))
+fn try_available_models_snapshot(agent: &Arc<Mutex<Agent>>) -> Option<String> {
+    let event = try_available_models_updated_event(agent)?;
+    Some(crate::protocol::encode_event(&event))
 }
 
 fn queue_soft_interrupt(
@@ -2575,22 +2739,20 @@ fn queue_soft_interrupt(
     content: String,
     urgent: bool,
     source: SoftInterruptSource,
-    soft_interrupt_queue: &SoftInterruptQueue,
+    session_control: &SessionControlHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    let _ = enqueue_soft_interrupt(soft_interrupt_queue, content, urgent, source);
+    let _ = session_control.queue_soft_interrupt(content, urgent, source);
     let _ = client_event_tx.send(ServerEvent::Ack { id });
 }
 
 fn clear_soft_interrupts(
     id: u64,
     session_id: &str,
-    soft_interrupt_queue: &SoftInterruptQueue,
+    session_control: &SessionControlHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    if let Ok(mut queue) = soft_interrupt_queue.lock() {
-        queue.clear();
-    }
+    session_control.clear_soft_interrupts();
     if let Err(err) = crate::soft_interrupt_store::clear(session_id) {
         crate::logging::warn(&format!(
             "Failed to clear persisted soft interrupts for {}: {}",
@@ -2602,10 +2764,10 @@ fn clear_soft_interrupts(
 
 fn move_tool_to_background(
     id: u64,
-    background_tool_signal: &InterruptSignal,
+    session_control: &SessionControlHandle,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
-    background_tool_signal.fire();
+    session_control.request_background_current_tool();
     let _ = client_event_tx.send(ServerEvent::Ack { id });
 }
 

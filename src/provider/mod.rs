@@ -78,10 +78,10 @@ pub trait Provider: Send + Sync {
     /// system_static: Static content (instruction files, base prompt) - cached
     /// system_dynamic: Dynamic content (date, git status, memory) - not cached
     /// Default implementation keeps static instructions in the provider's system field and moves
-    /// dynamic context into a late synthetic system-reminder message. This avoids putting changing
-    /// date/time/git/memory text at the beginning of the prompt for providers with implicit prefix
-    /// caching (OpenAI/Gemini/OpenRouter-compatible), while Anthropic overrides this with native
-    /// split system cache-control blocks.
+    /// dynamic context into a late synthetic system-reminder message after the latest user prompt.
+    /// This avoids putting changing date/time/git/memory text before cacheable conversation text for
+    /// providers with implicit prefix caching (OpenAI/Gemini/OpenRouter-compatible), while Anthropic
+    /// overrides this with native split system cache-control blocks.
     async fn complete_split(
         &self,
         messages: &[Message],
@@ -354,6 +354,23 @@ pub trait Provider: Send + Sync {
     }
 }
 
+pub fn set_model_with_auth_refresh(provider: &dyn Provider, model: &str) -> Result<()> {
+    match provider.set_model(model) {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            let first_message = first_err.to_string();
+            provider.on_auth_changed();
+            provider.set_model(model).map_err(|second_err| {
+                anyhow::anyhow!(
+                    "{} (retried after reloading auth from disk: {})",
+                    first_message,
+                    second_err
+                )
+            })
+        }
+    }
+}
+
 fn is_fresh_user_text_message(message: &Message) -> bool {
     if message.role != Role::User {
         return false;
@@ -399,6 +416,7 @@ fn messages_with_dynamic_system_context(
     let insert_at = out
         .iter()
         .rposition(is_fresh_user_text_message)
+        .map(|idx| idx + 1)
         .unwrap_or(out.len());
     out.insert(insert_at, dynamic_message);
     out
@@ -421,7 +439,7 @@ mod split_prompt_tests {
     }
 
     #[test]
-    fn dynamic_context_is_inserted_before_current_user_prompt() {
+    fn dynamic_context_is_inserted_after_current_user_prompt() {
         let messages = vec![
             Message::user("first user"),
             Message::assistant_text("assistant"),
@@ -434,8 +452,8 @@ mod split_prompt_tests {
         assert_eq!(out.len(), 4);
         assert_eq!(text_of(&out[0]), "first user");
         assert_eq!(text_of(&out[1]), "assistant");
-        assert!(text_of(&out[2]).starts_with("<system-reminder>\n# Environment"));
-        assert_eq!(text_of(&out[3]), "current user");
+        assert_eq!(text_of(&out[2]), "current user");
+        assert!(text_of(&out[3]).starts_with("<system-reminder>\n# Environment"));
     }
 
     #[test]
@@ -453,9 +471,9 @@ mod split_prompt_tests {
         assert_role_text(&out_a[1], Role::Assistant, "stable cached assistant");
         assert_role_text(&out_b[0], Role::User, "stable cached user");
         assert_role_text(&out_b[1], Role::Assistant, "stable cached assistant");
-        assert_ne!(text_of(&out_a[2]), text_of(&out_b[2]));
-        assert_role_text(&out_a[3], Role::User, "latest prompt");
-        assert_role_text(&out_b[3], Role::User, "latest prompt");
+        assert_role_text(&out_a[2], Role::User, "latest prompt");
+        assert_role_text(&out_b[2], Role::User, "latest prompt");
+        assert_ne!(text_of(&out_a[3]), text_of(&out_b[3]));
     }
 
     #[test]
@@ -769,6 +787,19 @@ impl MultiProvider {
         }
     }
 
+    fn openai_compatible_model_prefix(
+        model: &str,
+    ) -> Option<(crate::provider_catalog::OpenAiCompatibleProfile, &str)> {
+        let (prefix, rest) = model.split_once(':')?;
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return None;
+        }
+
+        let profile = crate::provider_catalog::openai_compatible_profile_by_id(prefix)?;
+        Some((profile, rest))
+    }
+
     fn explicit_model_provider_prefix(model: &str) -> Option<(ActiveProvider, &'static str, &str)> {
         if let Some(rest) = model.strip_prefix("copilot:") {
             Some((ActiveProvider::Copilot, "copilot:", rest))
@@ -801,6 +832,23 @@ impl MultiProvider {
         );
     }
 
+    fn ensure_provider_lock_allows_openai_compatible_profile(
+        &self,
+        requested_model: &str,
+    ) -> Result<()> {
+        let Some(forced) = self.forced_provider else {
+            return Ok(());
+        };
+        if forced == ActiveProvider::OpenRouter {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Model '{}' targets an OpenAI-compatible provider but --provider is locked to {}. Remove the provider-specific model prefix or use `--provider openai-compatible`.",
+            requested_model,
+            Self::provider_label(forced),
+        );
+    }
+
     fn model_name_for_provider<'a>(provider: ActiveProvider, model: &'a str) -> Cow<'a, str> {
         if matches!(provider, ActiveProvider::Claude)
             && let Some(canonical) = normalize_copilot_model_name(model)
@@ -815,6 +863,8 @@ impl MultiProvider {
         if model.is_empty() {
             anyhow::bail!("Model cannot be empty");
         }
+
+        self.reconcile_auth_if_provider_missing(provider);
 
         match provider {
             ActiveProvider::Claude => {
@@ -892,6 +942,35 @@ impl MultiProvider {
                 Ok(())
             }
         }
+    }
+
+    fn set_model_on_openai_compatible_profile(
+        &self,
+        profile: crate::provider_catalog::OpenAiCompatibleProfile,
+        model: &str,
+    ) -> Result<()> {
+        let model = model.trim();
+        if model.is_empty() {
+            anyhow::bail!("Model cannot be empty");
+        }
+        let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
+        if !crate::provider_catalog::openai_compatible_profile_is_configured(profile) {
+            anyhow::bail!(
+                "{} credentials not available. Run `jcode login --provider {}` first.",
+                resolved.display_name,
+                resolved.id,
+            );
+        }
+
+        crate::provider_catalog::force_apply_openai_compatible_profile_env(Some(profile));
+        let provider = Arc::new(openrouter::OpenRouterProvider::new()?);
+        provider.set_model(model)?;
+        *self
+            .openrouter
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
+        self.set_active_provider(ActiveProvider::OpenRouter);
+        Ok(())
     }
 }
 
@@ -998,6 +1077,12 @@ impl Provider for MultiProvider {
         let requested_model = model.trim();
         if requested_model.is_empty() {
             anyhow::bail!("Model cannot be empty");
+        }
+
+        if let Some((profile, target_model)) = Self::openai_compatible_model_prefix(requested_model)
+        {
+            self.ensure_provider_lock_allows_openai_compatible_profile(requested_model)?;
+            return self.set_model_on_openai_compatible_profile(profile, target_model);
         }
 
         // Provider-prefixed model names are explicit routing directives. They
@@ -1280,6 +1365,9 @@ impl Provider for MultiProvider {
         // OpenRouter models (with per-provider endpoints)
         let has_openrouter = self.openrouter_provider().is_some();
         if let Some(openrouter) = self.openrouter_provider() {
+            let openai_compatible_provider_label =
+                crate::provider_catalog::active_openai_compatible_display_name()
+                    .unwrap_or_else(|| "OpenAI-compatible".to_string());
             let current_openrouter_model = openrouter.model();
             let supports_openrouter_provider_features =
                 openrouter.supports_provider_routing_features();
@@ -1321,7 +1409,7 @@ impl Provider for MultiProvider {
                 } else {
                     routes.push(ModelRoute {
                         model: model.clone(),
-                        provider: "OpenAI-compatible".to_string(),
+                        provider: openai_compatible_provider_label.clone(),
                         api_method: "openai-compatible".to_string(),
                         available: has_openrouter,
                         detail: "custom endpoint".to_string(),
@@ -1343,7 +1431,42 @@ impl Provider for MultiProvider {
                     }
                 }
             }
-        } else {
+        }
+
+        let mut added_direct_openai_compatible_routes = false;
+        for profile in crate::provider_catalog::openai_compatible_profiles()
+            .iter()
+            .copied()
+        {
+            if !crate::provider_catalog::openai_compatible_profile_is_configured(profile) {
+                continue;
+            }
+            let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
+            let api_method = format!("openai-compatible:{}", resolved.id);
+            for model in crate::provider_catalog::openai_compatible_profile_static_models(profile) {
+                let already_present = routes.iter().any(|route| {
+                    route.model == model
+                        && route.provider == resolved.display_name
+                        && (route.api_method == "openai-compatible"
+                            || route.api_method == api_method)
+                });
+                if already_present {
+                    added_direct_openai_compatible_routes = true;
+                    continue;
+                }
+                routes.push(ModelRoute {
+                    model,
+                    provider: resolved.display_name.clone(),
+                    api_method: api_method.clone(),
+                    available: true,
+                    detail: resolved.api_base.clone(),
+                    cheapness: None,
+                });
+                added_direct_openai_compatible_routes = true;
+            }
+        }
+
+        if !has_openrouter && !added_direct_openai_compatible_routes {
             // OpenRouter not configured - show a few popular models as unavailable
             routes.push(ModelRoute {
                 model: "openrouter models".to_string(),

@@ -1,19 +1,8 @@
 use crate::storage;
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TodoItem {
-    pub content: String,
-    pub status: String,
-    pub priority: String,
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blocked_by: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assigned_to: Option<String>,
-}
+pub use jcode_task_types::TodoItem;
 
 pub fn load_todos(session_id: &str) -> Result<Vec<TodoItem>> {
     let path = todo_path(session_id)?;

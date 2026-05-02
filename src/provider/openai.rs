@@ -29,7 +29,7 @@ const CHATGPT_API_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const RESPONSES_PATH: &str = "responses";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const ORIGINATOR: &str = "codex_cli_rs";
-const CHATGPT_INSTRUCTIONS: &str = include_str!("../prompts/openai_chatgpt.md");
+const CHATGPT_INSTRUCTIONS: &str = include_str!("../prompt/system_prompt.md");
 const SELFDEV_SECTION_HEADER: &str = "# Self-Development Mode";
 
 /// Maximum number of retries for transient errors
@@ -416,6 +416,25 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    pub(crate) fn supports_extended_prompt_cache_retention(model_id: &str) -> bool {
+        let model = model_id.trim().to_ascii_lowercase();
+        model.starts_with("gpt-5.5")
+            || model.starts_with("gpt-5.4")
+            || model.starts_with("gpt-5.2")
+            || model.starts_with("gpt-5.1")
+            || model == "gpt-5"
+            || model.starts_with("gpt-5-")
+            || model.starts_with("gpt-4.1")
+    }
+
+    fn effective_prompt_cache_retention<'a>(
+        model_id: &str,
+        configured: Option<&'a str>,
+    ) -> Option<&'a str> {
+        configured
+            .or_else(|| Self::supports_extended_prompt_cache_retention(model_id).then_some("24h"))
+    }
+
     pub fn new(credentials: CodexCredentials) -> Self {
         // Check for model override from environment
         let mut model =
@@ -726,7 +745,9 @@ impl OpenAIProvider {
             if let Some(key) = prompt_cache_key {
                 request["prompt_cache_key"] = serde_json::json!(key);
             }
-            if let Some(retention) = prompt_cache_retention {
+            if let Some(retention) =
+                Self::effective_prompt_cache_retention(model_id, prompt_cache_retention)
+            {
                 request["prompt_cache_retention"] = serde_json::json!(retention);
             }
         }

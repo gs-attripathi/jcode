@@ -457,6 +457,32 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Ask the server to truncate the active session to a 1-based message index.
+    pub async fn rewind(&mut self, message_index: usize) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::Rewind { id, message_index };
+        self.next_request_id += 1;
+
+        // The server responds by sending a fresh History payload for the same
+        // session. Allow that payload to replace the current display state even
+        // though this connection has already completed its initial bootstrap.
+        self.has_loaded_history = false;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
+    /// Ask the server to undo the most recent rewind for the active session.
+    pub async fn rewind_undo(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+
+        // The server responds by sending a fresh History payload for the same
+        // session. Allow that payload to replace the current display state.
+        self.has_loaded_history = false;
+        self.send_request(Request::RewindUndo { id }).await?;
+        Ok(id)
+    }
+
     /// Cycle the active model on the server
     pub async fn cycle_model(&mut self, direction: i8) -> Result<()> {
         let request = Request::CycleModel {
@@ -674,41 +700,6 @@ impl RemoteConnection {
     pub async fn compact(&mut self) -> Result<u64> {
         let id = self.next_request_id;
         let request = Request::Compact { id };
-        self.next_request_id += 1;
-        self.send_request(request).await?;
-        Ok(id)
-    }
-
-    /// Ask the server to rewind the conversation to message `n` (1-based).
-    pub async fn rewind(&mut self, n: usize) -> Result<u64> {
-        let id = self.next_request_id;
-        let request = Request::Rewind { id, n };
-        self.next_request_id += 1;
-        self.send_request(request).await?;
-        Ok(id)
-    }
-
-    /// Ask the server to switch the active branch tip to a leaf identified by
-    /// short id suffix.
-    pub async fn checkout(&mut self, target: &str) -> Result<u64> {
-        let id = self.next_request_id;
-        let request = Request::Checkout {
-            id,
-            target: target.to_string(),
-        };
-        self.next_request_id += 1;
-        self.send_request(request).await?;
-        Ok(id)
-    }
-
-    /// Send an MCP control action (list / reload / connect / disconnect).
-    pub async fn mcp_control(&mut self, action: &str, server: Option<&str>) -> Result<u64> {
-        let id = self.next_request_id;
-        let request = Request::McpControl {
-            id,
-            action: action.to_string(),
-            server: server.map(|s| s.to_string()),
-        };
         self.next_request_id += 1;
         self.send_request(request).await?;
         Ok(id)

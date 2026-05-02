@@ -5,8 +5,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Instant;
 
 use super::args::{
-    AmbientCommand, Args, AuthCommand, Command, MemoryCommand, ModelCommand, PermissionModeArg,
-    ProviderCommand, RestartCommand, TranscriptModeArg,
+    AmbientCommand, Args, AuthCommand, Command, MemoryCommand, ModelCommand, ProviderCommand,
+    RestartCommand, TranscriptModeArg,
 };
 use crate::{
     agent, auth, build, provider, provider_catalog, server, session, setup_hints, startup_profile,
@@ -34,9 +34,16 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
     }
 
     match args.command {
-        Some(Command::Serve) => {
+        Some(Command::Serve {
+            temporary_server,
+            owner_pid,
+            temp_idle_timeout_secs,
+        }) => {
             let serve_start = Instant::now();
             crate::env::set_var("JCODE_NON_INTERACTIVE", "1");
+            if temporary_server {
+                server::configure_temporary_server(owner_pid, temp_idle_timeout_secs);
+            }
             let provider_start = Instant::now();
             let provider =
                 provider_init::init_provider(&args.provider, args.model.as_deref()).await?;
@@ -79,6 +86,9 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             json,
             complete,
             google_access_tier,
+            api_base,
+            api_key,
+            api_key_env,
         }) => {
             login::run_login(
                 &args.provider,
@@ -98,6 +108,10 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                             auth::google::GmailAccessTier::ReadOnly
                         }
                     }),
+                    openai_compatible_api_base: api_base,
+                    openai_compatible_api_key: api_key,
+                    openai_compatible_api_key_env: api_key_env,
+                    openai_compatible_default_model: args.model.clone(),
                 },
             )
             .await?;
@@ -146,6 +160,43 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
                 commands::run_provider_current_command(&args.provider, args.model.as_deref(), json)
                     .await?;
             }
+            ProviderCommand::Add {
+                name,
+                base_url,
+                model,
+                context_window,
+                api_key_env,
+                api_key,
+                api_key_stdin,
+                no_api_key,
+                auth,
+                auth_header,
+                env_file,
+                set_default,
+                overwrite,
+                provider_routing,
+                model_catalog,
+                json,
+            } => {
+                commands::run_provider_add_command(commands::ProviderAddOptions {
+                    name,
+                    base_url,
+                    model,
+                    context_window,
+                    api_key_env,
+                    api_key,
+                    api_key_stdin,
+                    no_api_key,
+                    auth,
+                    auth_header,
+                    env_file,
+                    set_default,
+                    overwrite,
+                    provider_routing,
+                    model_catalog,
+                    json,
+                })?;
+            }
         },
         Some(Command::Memory(subcmd)) => {
             commands::run_memory_command(map_memory_subcommand(subcmd))?;
@@ -156,25 +207,8 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         Some(Command::Pair { list, revoke }) => {
             commands::run_pair_command(list, revoke)?;
         }
-        Some(Command::Permissions { mode, status }) => {
-            if let Some(mode) = mode {
-                let mode = match mode {
-                    PermissionModeArg::Ask => crate::config::ToolPermissionMode::Ask,
-                    PermissionModeArg::Autopilot => crate::config::ToolPermissionMode::Autopilot,
-                };
-                crate::config::Config::set_tool_permission_mode(mode)?;
-                println!("Tool permission mode set to {}.", mode.as_str());
-            }
-            if status || mode.is_some() {
-                let cfg = crate::config::Config::load();
-                println!(
-                    "Current tool permission mode: {}",
-                    cfg.safety.tool_permission_mode.as_str()
-                );
-            }
-            if mode.is_none() && !status {
-                tui::permissions::run_permissions()?;
-            }
+        Some(Command::Permissions) => {
+            tui::permissions::run_permissions()?;
         }
         Some(Command::Transcript {
             text,
@@ -358,7 +392,13 @@ async fn run_default_command(args: Args) -> Result<()> {
 
     startup_profile::mark("run_main_none_branch");
 
-    if args.resume.is_none() && commands::maybe_run_pending_restart_restore_on_startup().await? {
+    let explicit_provider_or_model = args.provider != ProviderChoice::Auto
+        || args.model.is_some()
+        || args.provider_profile.is_some();
+    if args.resume.is_none()
+        && !explicit_provider_or_model
+        && commands::maybe_run_pending_restart_restore_on_startup().await?
+    {
         return Ok(());
     }
 
@@ -430,7 +470,7 @@ async fn run_default_command(args: Args) -> Result<()> {
         .await;
     }
 
-    if server_running && (args.provider != ProviderChoice::Auto || args.model.is_some()) {
+    if server_running && explicit_provider_or_model {
         output::stderr_info(
             "Server already running; provider/model flags only apply when starting a new server.",
         );

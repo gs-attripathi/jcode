@@ -1,3 +1,73 @@
+#[derive(Clone)]
+struct SetModelAuthRefreshMockProvider {
+    refreshed: Arc<std::sync::atomic::AtomicBool>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+    selected_model: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for SetModelAuthRefreshMockProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        unimplemented!("SetModelAuthRefreshMockProvider")
+    }
+
+    fn name(&self) -> &str {
+        "set-model-auth-refresh-mock"
+    }
+
+    fn model(&self) -> String {
+        self.selected_model
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "gpt-5.4".to_string())
+    }
+
+    fn set_model(&self, model: &str) -> Result<()> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.refreshed.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("Claude credentials not available");
+        }
+        *self.selected_model.lock().unwrap() = Some(model.to_string());
+        Ok(())
+    }
+
+    fn on_auth_changed(&self) {
+        self.refreshed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+#[test]
+fn test_set_model_with_auth_refresh_reloads_auth_and_retries_once() {
+    let provider = SetModelAuthRefreshMockProvider {
+        refreshed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        selected_model: Arc::new(std::sync::Mutex::new(None)),
+    };
+
+    set_model_with_auth_refresh(&provider, "claude-opus-4-6").expect("auth refresh retry succeeds");
+
+    assert!(provider.refreshed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        provider.attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "restore should try once, reload auth, then retry once"
+    );
+    assert_eq!(provider.model(), "claude-opus-4-6");
+}
+
 #[test]
 fn test_on_auth_changed_hot_initializes_openai_and_marks_routes_available() {
     with_clean_provider_test_env(|| {
@@ -117,6 +187,7 @@ fn test_on_auth_changed_hot_initializes_anthropic_and_marks_routes_available() {
             refresh: "test-refresh-token".to_string(),
             expires: i64::MAX,
             email: None,
+            scopes: Vec::new(),
             subscription_type: None,
         })
         .expect("save test Claude auth");
@@ -157,6 +228,7 @@ fn test_anthropic_model_routes_keep_plain_4_6_available_without_extra_usage() {
             refresh: "test-refresh-token".to_string(),
             expires: i64::MAX,
             email: None,
+            scopes: Vec::new(),
             subscription_type: None,
         })
         .expect("save test Claude auth");

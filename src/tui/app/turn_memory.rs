@@ -80,7 +80,17 @@ impl App {
             ));
         }
         self.push_display_message(DisplayMessage::memory(summary, display_prompt));
-        self.set_status_notice(format!("🧠 {} {} injected", count, plural));
+        let notice = if let Some(experimental_notice) =
+            self.note_experimental_feature_use("memory_injection")
+        {
+            format!(
+                "🧠 {} {} injected · ⚠ {}",
+                count, plural, experimental_notice
+            )
+        } else {
+            format!("🧠 {} {} injected", count, plural)
+        };
+        self.set_status_notice(notice);
     }
 
     /// Get memory prompt using async non-blocking approach

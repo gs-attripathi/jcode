@@ -487,7 +487,17 @@ pub(crate) fn build_header_lines(app: &dyn TuiState, width: u16) -> Vec<Line<'st
                         ""
                     }
                 }
-                "openrouter" => "api-key",
+                "openrouter" | "openai-compatible" => "api-key",
+                other
+                    if crate::provider_catalog::resolve_openai_compatible_profile_selection(other)
+                        .is_some()
+                        || crate::provider_catalog::openai_compatible_profile_id_for_display_name(
+                            other,
+                        )
+                        .is_some() =>
+                {
+                    "api-key"
+                }
                 _ => "",
             };
             if auth_tag.is_empty() {

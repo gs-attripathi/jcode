@@ -89,6 +89,62 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
 }
 
 #[test]
+fn initial_session_context_is_persisted_once_and_not_overwritten() {
+    let mut session = Session::create_with_id(
+        "session_context_test".to_string(),
+        None,
+        Some("Session context".to_string()),
+    );
+
+    assert!(session.ensure_initial_session_context_message());
+    assert_eq!(session.messages.len(), 1);
+    let first = session.messages[0].content_preview();
+    assert!(first.contains("# Session Context"));
+    assert!(first.contains("OS:"));
+    assert_eq!(
+        session.messages[0].display_role,
+        Some(StoredDisplayRole::System)
+    );
+
+    assert!(!session.ensure_initial_session_context_message());
+    assert_eq!(session.messages.len(), 1);
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert!(!session.ensure_initial_session_context_message());
+    assert_eq!(session.messages.len(), 2);
+}
+
+#[test]
+fn existing_non_empty_session_does_not_get_retroactive_session_context() {
+    let mut session = Session::create_with_id(
+        "session_context_existing_test".to_string(),
+        None,
+        Some("Existing".to_string()),
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "already started".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    assert!(!session.ensure_initial_session_context_message());
+    assert_eq!(session.messages.len(), 1);
+    assert!(
+        !session.messages[0]
+            .content_preview()
+            .contains("# Session Context")
+    );
+}
+
+#[test]
 fn load_startup_stub_preserves_metadata_but_skips_heavy_vectors() -> Result<()> {
     let _env_lock = lock_env();
     let temp_home = tempfile::Builder::new()
@@ -682,6 +738,29 @@ fn test_render_messages_honors_background_task_display_role_override() {
     assert_eq!(rendered.len(), 1);
     assert_eq!(rendered[0].role, "background_task");
     assert!(rendered[0].content.contains("**Background task**"));
+}
+
+#[test]
+fn test_render_messages_hides_internal_system_reminders() {
+    let mut session = Session::create_with_id(
+        "session_hidden_system_reminder_test".to_string(),
+        None,
+        Some("hidden reminder test".to_string()),
+    );
+
+    assert!(session.ensure_initial_session_context_message());
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "visible prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    let rendered = render_messages(&session);
+    assert_eq!(rendered.len(), 1);
+    assert_eq!(rendered[0].role, "user");
+    assert_eq!(rendered[0].content, "visible prompt");
 }
 
 #[test]

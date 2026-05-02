@@ -300,11 +300,6 @@ impl Config {
         }
 
         // Safety / notifications
-        if let Ok(v) = std::env::var("JCODE_TOOL_PERMISSION_MODE")
-            && let Some(mode) = ToolPermissionMode::parse(&v)
-        {
-            self.safety.tool_permission_mode = mode;
-        }
         if let Ok(v) = std::env::var("JCODE_NTFY_TOPIC") {
             self.safety.ntfy_topic = Some(v);
         }

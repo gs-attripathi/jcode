@@ -68,6 +68,18 @@ fn auth_timing_logging_enabled() -> bool {
     env_truthy("JCODE_AUTH_TIMING")
 }
 
+fn copilot_auth_state_from_credentials() -> (AuthState, bool) {
+    if !copilot::has_copilot_credentials_fast() {
+        return (AuthState::NotConfigured, false);
+    }
+
+    if copilot::validation_failure_blocks_auto_use() {
+        (AuthState::Expired, false)
+    } else {
+        (AuthState::Available, true)
+    }
+}
+
 impl AuthStatus {
     /// Check all authentication sources and return their status.
     /// Results are cached for 30 seconds to avoid expensive PATH scanning on every frame.
@@ -93,12 +105,15 @@ impl AuthStatus {
 
     /// Fast auth snapshot for interactive UI surfaces like `/account`.
     ///
-    /// Prefers any previously cached full probe (even if stale), and otherwise
-    /// falls back to a cheap local-files/env-only probe that avoids subprocesses
-    /// such as `cursor-agent status` or `sqlite3` lookups.
+    /// Prefers a recent full probe, and otherwise falls back to a cheap
+    /// local-files/env-only probe that avoids subprocesses such as
+    /// `cursor-agent status` or `sqlite3` lookups. Do not reuse the full cache
+    /// forever: external credential files may be deleted or replaced while the
+    /// process is running.
     pub fn check_fast() -> Self {
         if let Ok(cache) = AUTH_STATUS_CACHE.read()
-            && let Some((ref status, _)) = *cache
+            && let Some((ref status, ref when)) = *cache
+            && when.elapsed().as_secs() < AUTH_STATUS_CACHE_TTL_SECS
         {
             return status.clone();
         }
@@ -534,13 +549,13 @@ impl AuthStatus {
             status.openai = AuthState::Available;
         }
 
-        // Check external/CLI auth providers (presence of installed CLI tooling)
-        status.copilot = if copilot::has_copilot_credentials_fast() {
-            status.copilot_has_api_token = true;
-            AuthState::Available
-        } else {
-            AuthState::NotConfigured
-        };
+        // Check external/CLI auth providers (presence of installed CLI tooling).
+        // If auth-test recently proved that the local Copilot OAuth token cannot
+        // be exchanged, keep it visible as expired for diagnostics but do not let
+        // startup/default-provider selection treat it as a usable API token.
+        let (copilot_state, copilot_has_api_token) = copilot_auth_state_from_credentials();
+        status.copilot = copilot_state;
+        status.copilot_has_api_token = copilot_has_api_token;
 
         status.antigravity = match antigravity::load_tokens() {
             Ok(tokens) => {
@@ -674,12 +689,9 @@ impl AuthStatus {
         timings.push(("openai", step_start.elapsed().as_millis()));
 
         let step_start = Instant::now();
-        status.copilot = if copilot::has_copilot_credentials() {
-            status.copilot_has_api_token = true;
-            AuthState::Available
-        } else {
-            AuthState::NotConfigured
-        };
+        let (copilot_state, copilot_has_api_token) = copilot_auth_state_from_credentials();
+        status.copilot = copilot_state;
+        status.copilot_has_api_token = copilot_has_api_token;
         timings.push(("copilot", step_start.elapsed().as_millis()));
 
         let step_start = Instant::now();

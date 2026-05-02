@@ -56,6 +56,7 @@ fn oauth_tokens_serialization_roundtrip() -> Result<()> {
         refresh_token: "rt_def".to_string(),
         expires_at: 1234567890,
         id_token: Some("idt_ghi".to_string()),
+        scopes: Vec::new(),
     };
     let json = serde_json::to_string(&tokens)?;
     let parsed: OAuthTokens = serde_json::from_str(&json)?;
@@ -73,6 +74,7 @@ fn oauth_tokens_without_id_token() -> Result<()> {
         refresh_token: "rt".to_string(),
         expires_at: 0,
         id_token: None,
+        scopes: Vec::new(),
     };
     let json = serde_json::to_string(&tokens)?;
     assert!(!json.contains("id_token"));
@@ -92,6 +94,7 @@ fn save_openai_tokens_uses_jcode_home_sandbox() -> Result<()> {
         refresh_token: "rt_sandbox".to_string(),
         expires_at: 1234567890,
         id_token: Some("id_sandbox".to_string()),
+        scopes: Vec::new(),
     };
 
     save_openai_tokens(&tokens)?;
@@ -108,13 +111,65 @@ fn save_openai_tokens_uses_jcode_home_sandbox() -> Result<()> {
 }
 
 #[test]
+fn save_claude_tokens_preserves_existing_account_metadata() -> Result<()> {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+
+    crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
+        label: "claude-1".to_string(),
+        access: "old_access".to_string(),
+        refresh: "old_refresh".to_string(),
+        expires: 1,
+        email: Some("user@example.com".to_string()),
+        subscription_type: Some("pro".to_string()),
+        scopes: vec!["user:inference".to_string()],
+    })?;
+
+    let refreshed = OAuthTokens {
+        access_token: "new_access".to_string(),
+        refresh_token: "new_refresh".to_string(),
+        expires_at: 2,
+        id_token: None,
+        scopes: Vec::new(),
+    };
+    save_claude_tokens_for_account(&refreshed, "claude-1")?;
+
+    let account = crate::auth::claude::list_accounts()?
+        .into_iter()
+        .find(|account| account.label == "claude-1")
+        .expect("claude account should exist");
+    assert_eq!(account.access, "new_access");
+    assert_eq!(account.refresh, "new_refresh");
+    assert_eq!(account.email.as_deref(), Some("user@example.com"));
+    assert_eq!(account.subscription_type.as_deref(), Some("pro"));
+    assert_eq!(account.scopes, vec!["user:inference".to_string()]);
+    Ok(())
+}
+
+#[test]
 fn claude_oauth_constants() {
     assert!(!claude::CLIENT_ID.is_empty());
-    assert!(claude::AUTHORIZE_URL.starts_with("https://"));
-    assert!(claude::TOKEN_URL.starts_with("https://"));
+    assert_eq!(
+        claude::AUTHORIZE_URL,
+        "https://claude.com/cai/oauth/authorize"
+    );
+    assert_eq!(
+        claude::CONSOLE_AUTHORIZE_URL,
+        "https://platform.claude.com/oauth/authorize"
+    );
+    assert_eq!(
+        claude::TOKEN_URL,
+        "https://platform.claude.com/v1/oauth/token"
+    );
     assert!(claude::PROFILE_URL.starts_with("https://"));
-    assert!(claude::REDIRECT_URI.starts_with("https://"));
-    assert!(!claude::SCOPES.is_empty());
+    assert_eq!(
+        claude::REDIRECT_URI,
+        "https://platform.claude.com/oauth/code/callback"
+    );
+    assert!(claude::SCOPES.contains("user:inference"));
+    assert!(claude::SCOPES.contains("user:sessions:claude_code"));
+    assert!(claude::REFRESH_SCOPES.contains("user:file_upload"));
 }
 
 #[tokio::test]

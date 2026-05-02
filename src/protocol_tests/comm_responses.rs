@@ -154,6 +154,8 @@ fn test_comm_members_roundtrip_includes_status() -> Result<()> {
             detail: Some("working on tests".to_string()),
             role: Some("agent".to_string()),
             is_headless: Some(true),
+            report_back_to_session_id: Some("sess-coord".to_string()),
+            latest_completion_report: None,
             live_attachments: Some(0),
             status_age_secs: Some(12),
         }],
@@ -173,8 +175,27 @@ fn test_comm_members_roundtrip_includes_status() -> Result<()> {
     assert_eq!(members[0].status.as_deref(), Some("running"));
     assert_eq!(members[0].detail.as_deref(), Some("working on tests"));
     assert_eq!(members[0].is_headless, Some(true));
+    assert_eq!(
+        members[0].report_back_to_session_id.as_deref(),
+        Some("sess-coord")
+    );
     assert_eq!(members[0].live_attachments, Some(0));
     assert_eq!(members[0].status_age_secs, Some(12));
+    Ok(())
+}
+
+#[test]
+fn test_session_close_requested_roundtrip() -> Result<()> {
+    let event = ServerEvent::SessionCloseRequested {
+        reason: "Stopped by coordinator coord".to_string(),
+    };
+    let json = encode_event(&event);
+    assert!(json.contains("\"type\":\"session_close_requested\""));
+    let decoded = parse_event_json(json.trim())?;
+    let ServerEvent::SessionCloseRequested { reason } = decoded else {
+        return Err(anyhow!("expected SessionCloseRequested"));
+    };
+    assert_eq!(reason, "Stopped by coordinator coord");
     Ok(())
 }
 

@@ -126,7 +126,6 @@ async fn handle_get_history_falls_back_to_persisted_snapshot_when_agent_is_busy(
         timestamp: None,
         tool_duration_ms: None,
         token_usage: None,
-        parent_id: None,
     });
     session.save().expect("save session");
 

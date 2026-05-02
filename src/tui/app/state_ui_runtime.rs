@@ -87,6 +87,7 @@ impl App {
 
     pub(super) fn push_turn_footer(&mut self, duration: Option<f32>) {
         self.log_cache_miss_if_unexpected();
+        self.record_completed_stream_cache_usage();
 
         self.last_api_completed = Some(Instant::now());
         self.last_api_completed_provider = Some(<Self as TuiState>::provider_name(self));

@@ -57,6 +57,7 @@ pub(crate) fn build_single_session_vertices(
         push_native_activity_spinner(&mut vertices, size, spinner_tick);
     }
     push_single_session_transcript_cards(&mut vertices, app, size);
+    push_single_session_streaming_shimmer(&mut vertices, app, size, spinner_tick);
     push_single_session_selection(&mut vertices, app, size);
 
     vertices
@@ -184,6 +185,95 @@ fn push_single_session_transcript_cards(
             size,
         );
     }
+}
+
+pub(crate) fn push_single_session_streaming_shimmer(
+    vertices: &mut Vec<Vertex>,
+    app: &SingleSessionApp,
+    size: PhysicalSize<u32>,
+    tick: u64,
+) {
+    let Some(shimmer) = single_session_streaming_shimmer(app, size, tick) else {
+        return;
+    };
+
+    push_rect(
+        vertices,
+        shimmer.soft_rect,
+        STREAMING_SHIMMER_SOFT_COLOR,
+        size,
+    );
+    push_rect(
+        vertices,
+        shimmer.core_rect,
+        STREAMING_SHIMMER_CORE_COLOR,
+        size,
+    );
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SingleSessionStreamingShimmer {
+    pub(crate) soft_rect: Rect,
+    pub(crate) core_rect: Rect,
+}
+
+pub(crate) fn single_session_streaming_shimmer(
+    app: &SingleSessionApp,
+    size: PhysicalSize<u32>,
+    tick: u64,
+) -> Option<SingleSessionStreamingShimmer> {
+    if app.streaming_response.trim().is_empty() {
+        return None;
+    }
+
+    let visible_lines = single_session_visible_styled_body(app, size);
+    let line_index = visible_lines.iter().rposition(is_shimmer_anchor_line)?;
+
+    let typography = single_session_typography();
+    let line_height = typography.body_size * typography.body_line_height;
+    let text_columns = visible_lines[line_index].text.chars().count().max(8) as f32;
+    let text_width = (text_columns * single_session_body_char_width())
+        .min((size.width as f32 - PANEL_TITLE_LEFT_PADDING * 2.0).max(1.0));
+    let lane_width = (text_width + 56.0).max(120.0);
+    let shimmer_width = lane_width.min(180.0).max(72.0);
+    let phase = (tick % 48) as f32 / 48.0;
+    let travel = lane_width + shimmer_width;
+    let head_x = PANEL_TITLE_LEFT_PADDING - shimmer_width + phase * travel;
+    let y = PANEL_BODY_TOP_PADDING + line_index as f32 * line_height + line_height * 0.12;
+    let height = line_height * 0.76;
+
+    let soft_rect = Rect {
+        x: head_x,
+        y,
+        width: shimmer_width,
+        height,
+    };
+    let core_rect = Rect {
+        x: head_x + shimmer_width * 0.34,
+        y,
+        width: shimmer_width * 0.32,
+        height,
+    };
+    Some(SingleSessionStreamingShimmer {
+        soft_rect,
+        core_rect,
+    })
+}
+
+fn is_shimmer_anchor_line(line: &SingleSessionStyledLine) -> bool {
+    !line.text.trim().is_empty() && is_assistant_rendered_style(line.style)
+}
+
+fn is_assistant_rendered_style(style: SingleSessionLineStyle) -> bool {
+    matches!(
+        style,
+        SingleSessionLineStyle::Assistant
+            | SingleSessionLineStyle::AssistantHeading
+            | SingleSessionLineStyle::AssistantQuote
+            | SingleSessionLineStyle::AssistantTable
+            | SingleSessionLineStyle::AssistantLink
+            | SingleSessionLineStyle::Code
+    )
 }
 
 pub(crate) fn single_session_transcript_card_runs(
@@ -576,39 +666,82 @@ fn single_session_styled_text_buffer(
         font_system,
         segments
             .iter()
-            .map(|(text, style)| (text.as_str(), single_session_line_attrs(*style))),
+            .map(|(text, color)| (text.as_str(), single_session_color_attrs(*color))),
         Shaping::Basic,
     );
     buffer.shape_until_scroll(font_system);
     buffer
 }
 
-fn single_session_styled_text_segments(
+pub(crate) fn single_session_styled_text_segments(
     lines: &[SingleSessionStyledLine],
-) -> Vec<(String, SingleSessionLineStyle)> {
+) -> Vec<(String, TextColor)> {
     let mut segments = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         if !line.text.is_empty() {
-            segments.push((line.text.clone(), line.style));
+            if line.style == SingleSessionLineStyle::User {
+                push_user_prompt_segments(&mut segments, &line.text);
+            } else {
+                segments.push((line.text.clone(), single_session_line_color(line.style)));
+            }
         }
         if index + 1 < lines.len() {
-            segments.push(("\n".to_string(), SingleSessionLineStyle::Blank));
+            segments.push((
+                "\n".to_string(),
+                single_session_line_color(SingleSessionLineStyle::Blank),
+            ));
         }
     }
     if segments.is_empty() {
-        segments.push((String::new(), SingleSessionLineStyle::Blank));
+        segments.push((
+            String::new(),
+            single_session_line_color(SingleSessionLineStyle::Blank),
+        ));
     }
     segments
 }
 
-fn single_session_line_attrs(style: SingleSessionLineStyle) -> Attrs<'static> {
+fn push_user_prompt_segments(segments: &mut Vec<(String, TextColor)>, line: &str) {
+    let Some((number, text)) = line.split_once("  ") else {
+        segments.push((
+            line.to_string(),
+            single_session_line_color(SingleSessionLineStyle::User),
+        ));
+        return;
+    };
+    let Ok(turn) = number.parse::<usize>() else {
+        segments.push((
+            line.to_string(),
+            single_session_line_color(SingleSessionLineStyle::User),
+        ));
+        return;
+    };
+
+    segments.push((number.to_string(), user_prompt_number_color(turn)));
+    segments.push(("› ".to_string(), text_color(USER_PROMPT_ACCENT_COLOR)));
+    segments.push((
+        text.to_string(),
+        single_session_line_color(SingleSessionLineStyle::User),
+    ));
+}
+
+fn single_session_color_attrs(color: TextColor) -> Attrs<'static> {
     Attrs::new()
         .family(Family::Name(SINGLE_SESSION_FONT_FAMILY))
-        .color(single_session_line_color(style))
+        .color(color)
+}
+
+pub(crate) fn user_prompt_number_color(turn: usize) -> TextColor {
+    let index = turn.saturating_sub(1) % USER_PROMPT_NUMBER_COLORS.len();
+    text_color(USER_PROMPT_NUMBER_COLORS[index])
 }
 
 pub(crate) fn single_session_line_color(style: SingleSessionLineStyle) -> TextColor {
-    text_color(match style {
+    text_color(single_session_line_rgba(style))
+}
+
+fn single_session_line_rgba(style: SingleSessionLineStyle) -> [f32; 4] {
+    match style {
         SingleSessionLineStyle::Assistant => ASSISTANT_TEXT_COLOR,
         SingleSessionLineStyle::AssistantHeading => ASSISTANT_HEADING_TEXT_COLOR,
         SingleSessionLineStyle::AssistantQuote => ASSISTANT_QUOTE_TEXT_COLOR,
@@ -624,7 +757,7 @@ pub(crate) fn single_session_line_color(style: SingleSessionLineStyle) -> TextCo
         SingleSessionLineStyle::OverlayTitle => PANEL_TITLE_COLOR,
         SingleSessionLineStyle::Overlay => OVERLAY_TEXT_COLOR,
         SingleSessionLineStyle::OverlaySelection => OVERLAY_SELECTION_TEXT_COLOR,
-    })
+    }
 }
 
 pub(crate) fn single_session_text_areas(
@@ -723,7 +856,7 @@ pub(crate) fn desktop_header_version_label() -> String {
     format!("{binary} · {version}")
 }
 
-fn text_color(color: [f32; 4]) -> TextColor {
+pub(crate) fn text_color(color: [f32; 4]) -> TextColor {
     TextColor::rgba(
         (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
         (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,

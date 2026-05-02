@@ -74,6 +74,7 @@ pub(in crate::tui::app) fn handle_server_event(
         }
         ServerEvent::ToolStart { id, name } => {
             app.pause_streaming_tps(false);
+            app.clear_active_experimental_feature_notice();
             remote.handle_tool_start(&id, &name);
             app.commit_pending_streaming_assistant_message();
             if matches!(name.as_str(), "memory") {
@@ -101,6 +102,9 @@ pub(in crate::tui::app) fn handle_server_event(
                 input: parsed_input.clone(),
                 intent: ToolCall::intent_from_input(&parsed_input),
             };
+            if let Some(key) = App::experimental_feature_key_for_tool(&tool_call) {
+                app.note_experimental_feature_use(key);
+            }
             if let Some(tc) = app.streaming_tool_calls.iter_mut().find(|tc| tc.id == id) {
                 tc.input = parsed_input;
                 tc.refresh_intent_from_input();
@@ -251,11 +255,13 @@ pub(in crate::tui::app) fn handle_server_event(
         }
         ServerEvent::Done { id } => {
             let mut auto_poked = false;
+            let mut completed_current_message = false;
             crate::logging::info(&format!(
                 "Client received Done id={}, current_message_id={:?}",
                 id, app.current_message_id
             ));
             if app.current_message_id == Some(id) {
+                completed_current_message = true;
                 app.clear_pending_remote_retry();
                 if let Some(chunk) = app.stream_buffer.flush() {
                     app.append_streaming_text(&chunk);
@@ -311,7 +317,7 @@ pub(in crate::tui::app) fn handle_server_event(
                     ));
                 }
             }
-            auto_poked
+            completed_current_message || auto_poked
         }
         ServerEvent::Error {
             message,
@@ -388,6 +394,14 @@ pub(in crate::tui::app) fn handle_server_event(
             app.note_client_focus(true);
             app.update_terminal_title();
             false
+        }
+        ServerEvent::SessionCloseRequested { reason } => {
+            app.push_display_message(DisplayMessage::system(format!(
+                "Session close requested by coordinator: {reason}"
+            )));
+            app.set_status_notice("Session close requested by coordinator".to_string());
+            app.should_quit = true;
+            true
         }
         ServerEvent::Reloading { .. } => {
             app.append_reload_message("🔄 Server reload initiated...");
@@ -480,6 +494,19 @@ pub(in crate::tui::app) fn handle_server_event(
                 app.streaming_output_tokens = 0;
                 app.streaming_cache_read_tokens = None;
                 app.streaming_cache_creation_tokens = None;
+                app.total_cache_reported_input_tokens = 0;
+                app.total_cache_read_tokens = 0;
+                app.total_cache_creation_tokens = 0;
+                app.total_cache_optimal_input_tokens = 0;
+                app.last_cache_reported_input_tokens = None;
+                app.last_cache_read_tokens = None;
+                app.last_cache_optimal_input_tokens = None;
+                app.cache_next_optimal_input_tokens = None;
+                app.kv_cache_baseline = None;
+                app.pending_kv_cache_request = None;
+                app.kv_cache_turn_number = None;
+                app.kv_cache_turn_call_index = 0;
+                app.kv_cache_miss_samples.clear();
                 app.processing_started = None;
                 app.clear_visible_turn_started();
                 app.replay_processing_started_ms = None;
@@ -631,6 +658,24 @@ pub(in crate::tui::app) fn handle_server_event(
                     app.set_status_notice("Reload complete — prompt preserved");
                 }
                 app.note_runtime_memory_event_force("history_loaded", "remote_history_applied");
+                if let Some(notice) = app.pending_remote_rewind_notice.take() {
+                    let content = if notice.undo {
+                        "✓ Undid rewind. Restored the messages removed by the last rewind."
+                            .to_string()
+                    } else {
+                        format!(
+                            "✓ Rewound to message {}. Removed {} message{}. Undo anytime with `/rewind undo`.",
+                            notice.message_index.unwrap_or_default(),
+                            notice.changed_messages,
+                            if notice.changed_messages == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )
+                    };
+                    app.push_display_message(DisplayMessage::system(content));
+                }
             } else {
                 crate::logging::info(
                     "Ignoring duplicate History event for active session after local state was restored",
@@ -833,6 +878,8 @@ pub(in crate::tui::app) fn handle_server_event(
             false
         }
         ServerEvent::AvailableModelsUpdated {
+            provider_name,
+            provider_model,
             available_models,
             available_model_routes,
         } => {
@@ -853,9 +900,26 @@ pub(in crate::tui::app) fn handle_server_event(
                     summary.models_added, summary.routes_added, summary.routes_changed
                 ));
             }
+            let mut provider_meta_changed = false;
+            if let Some(name) = provider_name
+                && app.remote_provider_name.as_deref() != Some(name.as_str())
+            {
+                app.remote_provider_name = Some(name);
+                provider_meta_changed = true;
+            }
+            if let Some(model) = provider_model
+                && app.remote_provider_model.as_deref() != Some(model.as_str())
+            {
+                app.update_context_limit_for_model(&model);
+                app.remote_provider_model = Some(model);
+                provider_meta_changed = true;
+            }
             app.remote_available_entries = available_models;
             app.remote_model_options = available_model_routes;
             app.invalidate_model_picker_cache();
+            if provider_meta_changed {
+                app.update_terminal_title();
+            }
             false
         }
         ServerEvent::ReasoningEffortChanged { effort, error, .. } => {
@@ -1205,68 +1269,6 @@ pub(in crate::tui::app) fn handle_server_event(
             } else {
                 app.push_display_message(DisplayMessage::system(message));
                 app.set_status_notice("Compaction failed");
-            }
-            false
-        }
-        ServerEvent::McpResult {
-            output, success, ..
-        } => {
-            if success {
-                app.push_display_message(DisplayMessage::system(output));
-            } else {
-                app.push_display_message(DisplayMessage::error(output));
-            }
-            false
-        }
-        ServerEvent::Rewound {
-            messages,
-            kept,
-            removed,
-            truncated,
-            ..
-        } => {
-            if truncated {
-                let restored = messages
-                    .into_iter()
-                    .map(|msg| DisplayMessage {
-                        role: msg.role,
-                        content: msg.content,
-                        tool_calls: msg.tool_calls.unwrap_or_default(),
-                        duration_secs: None,
-                        title: None,
-                        tool_data: msg.tool_data,
-                    })
-                    .collect();
-                app.replace_display_messages(restored);
-                app.provider_session_id = None;
-                app.session.provider_session_id = None;
-                app.push_display_message(DisplayMessage::system(format!(
-                    "✓ Rewound to prompt {kept}. Removed {removed} message{}.",
-                    if removed == 1 { "" } else { "s" }
-                )));
-                app.set_status_notice(format!("Rewound to prompt {kept}"));
-                app.follow_chat_bottom();
-            } else {
-                let prompts: Vec<&crate::protocol::HistoryMessage> = messages
-                    .iter()
-                    .filter(|m| m.role == "user")
-                    .collect();
-                if prompts.is_empty() {
-                    app.push_display_message(DisplayMessage::system(
-                        "No prompts in conversation.".to_string(),
-                    ));
-                } else {
-                    let mut listing = String::from("**Your prompts:**\n\n");
-                    for (i, msg) in prompts.iter().enumerate() {
-                        let flattened = msg.content.trim().replace('\n', " ");
-                        let preview = crate::util::truncate_str(flattened.as_str(), 80);
-                        listing.push_str(&format!("  `{}` - {}\n", i + 1, preview));
-                    }
-                    listing.push_str(
-                        "\nUse `/rewind N` to keep prompts 1..N and drop everything after the assistant's reply to prompt N.",
-                    );
-                    app.push_display_message(DisplayMessage::system(listing));
-                }
             }
             false
         }

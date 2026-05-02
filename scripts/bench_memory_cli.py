@@ -352,6 +352,8 @@ def run_tool(spec: ToolSpec, sessions: int, cwd: Path, timeout_s: float, settle_
                 env.update(spec.env)
             env["JCODE_HOME"] = os.path.join(temp_root, "home")
             env["JCODE_RUNTIME_DIR"] = os.path.join(temp_root, "run")
+            env["JCODE_TEMP_SERVER"] = "1"
+            env["JCODE_SERVER_OWNER_PID"] = str(os.getpid())
             os.makedirs(env["JCODE_HOME"], exist_ok=True)
             os.makedirs(env["JCODE_RUNTIME_DIR"], exist_ok=True)
             if spec.name == "jcode_memory_on":

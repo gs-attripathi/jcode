@@ -1,7 +1,9 @@
 use crate::bus::FileOp;
 use crate::plan::PlanItem;
 use crate::protocol::ServerEvent;
-use jcode_agent_runtime::{SoftInterruptMessage, SoftInterruptQueue, SoftInterruptSource};
+use jcode_agent_runtime::{
+    InterruptSignal, SoftInterruptMessage, SoftInterruptQueue, SoftInterruptSource,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -210,6 +212,8 @@ pub struct SwarmMemberRecord {
     pub detail: Option<String>,
     pub friendly_name: Option<String>,
     pub report_back_to_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_completion_report: Option<String>,
     pub role: SwarmRole,
     pub is_headless: bool,
 }
@@ -445,6 +449,8 @@ pub struct SwarmMember {
     pub friendly_name: Option<String>,
     /// Session that should receive direct completion report-back for this member, if any.
     pub report_back_to_session_id: Option<String>,
+    /// Latest explicit completion report submitted by this member.
+    pub latest_completion_report: Option<String>,
     /// Role: "agent", "coordinator", "worktree_manager"
     pub role: String,
     /// When this member joined the swarm
@@ -467,6 +473,7 @@ impl SwarmMember {
             detail: self.detail.clone(),
             friendly_name: self.friendly_name.clone(),
             report_back_to_session_id: self.report_back_to_session_id.clone(),
+            latest_completion_report: self.latest_completion_report.clone(),
             role: SwarmRole::from(self.role.clone()),
             is_headless: self.is_headless,
         }
@@ -497,6 +504,7 @@ impl SwarmMember {
             detail: record.detail,
             friendly_name: record.friendly_name,
             report_back_to_session_id: record.report_back_to_session_id,
+            latest_completion_report: record.latest_completion_report,
             role: record.role.as_str().into_owned(),
             joined_at: Instant::now(),
             last_status_change: Instant::now(),
@@ -811,6 +819,85 @@ pub(super) fn enqueue_soft_interrupt(
         true
     } else {
         false
+    }
+}
+
+/// Lock-free control-plane handles for a live session.
+///
+/// This intentionally exposes only out-of-band controls that are safe to use
+/// while a turn owns the Agent mutex. Stateful operations such as history
+/// mutation, model changes, or direct tool execution should continue to
+/// coordinate through the Agent lock after the turn is idle/stopped.
+#[derive(Clone)]
+pub struct SessionControlHandle {
+    pub session_id: String,
+    soft_interrupt_queue: SoftInterruptQueue,
+    background_tool_signal: Option<InterruptSignal>,
+    stop_current_turn_signal: InterruptSignal,
+}
+
+impl SessionControlHandle {
+    pub fn new(
+        session_id: impl Into<String>,
+        soft_interrupt_queue: SoftInterruptQueue,
+        background_tool_signal: InterruptSignal,
+        stop_current_turn_signal: InterruptSignal,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            soft_interrupt_queue,
+            background_tool_signal: Some(background_tool_signal),
+            stop_current_turn_signal,
+        }
+    }
+
+    pub fn cancel_only(
+        session_id: impl Into<String>,
+        soft_interrupt_queue: SoftInterruptQueue,
+        stop_current_turn_signal: InterruptSignal,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            soft_interrupt_queue,
+            background_tool_signal: None,
+            stop_current_turn_signal,
+        }
+    }
+
+    pub fn queue_soft_interrupt(
+        &self,
+        content: String,
+        urgent: bool,
+        source: SoftInterruptSource,
+    ) -> bool {
+        enqueue_soft_interrupt(&self.soft_interrupt_queue, content, urgent, source)
+    }
+
+    pub fn clear_soft_interrupts(&self) {
+        if let Ok(mut queue) = self.soft_interrupt_queue.lock() {
+            queue.clear();
+        }
+    }
+
+    pub fn request_cancel(&self) {
+        self.stop_current_turn_signal.fire();
+    }
+
+    pub fn reset_cancel(&self) {
+        self.stop_current_turn_signal.reset();
+    }
+
+    pub fn request_background_current_tool(&self) -> bool {
+        if let Some(signal) = &self.background_tool_signal {
+            signal.fire();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn stop_current_turn_signal(&self) -> InterruptSignal {
+        self.stop_current_turn_signal.clone()
     }
 }
 

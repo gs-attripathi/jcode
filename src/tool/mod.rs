@@ -439,15 +439,6 @@ impl Registry {
         tools.keys().cloned().collect()
     }
 
-    /// Cheap count of registered tools without cloning names. Used by the
-    /// agent's locked-tool-list check: when this grows past the locked
-    /// snapshot's size (e.g. MCP tools finished registering after the
-    /// initial lock), the agent invalidates the lock so the next request
-    /// picks up the new tools.
-    pub async fn tool_count(&self) -> usize {
-        self.tools.read().await.len()
-    }
-
     /// Enable test mode for memory tools (isolated storage)
     /// Called when session is marked as debug
     pub async fn enable_memory_test_mode(&self) {
@@ -469,30 +460,6 @@ impl Registry {
     /// sub-tool calls (e.g. inside `batch`), but our registry uses internal
     /// names (`grep`, `bash`). This mapping ensures both forms resolve
     /// correctly.
-    /// Hand the model a corrective hint when it calls a tool name we don't
-    /// have. Without this, Sonnet (trained around Claude Code) often calls
-    /// `ToolSearch` once, sees "Unknown tool", and concludes "no web
-    /// search tool exists" instead of looking at the actual catalog.
-    fn tool_name_suggestion(name: &str) -> &'static str {
-        match name {
-            "ToolSearch" | "tool_search" => {
-                " (For web search, use the `websearch` tool. `ToolSearch` is a Claude Code construct that doesn't exist in jcode.)"
-            }
-            "Read" | "View" => " (Did you mean `read`?)",
-            "Write" | "Create" => " (Did you mean `write`?)",
-            "Edit" | "Replace" => " (Did you mean `edit`?)",
-            "Bash" | "Shell" => " (Did you mean `bash`?)",
-            "Glob" => " (Did you mean `glob`?)",
-            "Grep" | "Search" => " (Did you mean `grep` or `agentgrep`?)",
-            "LS" | "List" => " (Did you mean `ls`?)",
-            "Task" | "TaskCreate" | "TaskUpdate" | "TaskList" | "TaskGet" => {
-                " (Did you mean `todo`?)"
-            }
-            "Agent" => " (Did you mean `subagent`?)",
-            _ => "",
-        }
-    }
-
     fn resolve_tool_name(name: &str) -> &str {
         match name {
             "communicate" => "swarm",
@@ -505,15 +472,6 @@ impl Registry {
             "file_glob" => "glob",
             "file_grep" => "grep",
             "todoread" | "todowrite" | "todo_read" | "todo_write" => "todo",
-            // Claude Sonnet was trained around Claude Code where web search
-            // is `WebSearch` / `web_search`. Alias to jcode's `websearch`.
-            // (Do NOT alias `ToolSearch` — in Claude Code that tool returns
-            // tool *schemas*, not web results, and the model gets confused
-            // when it expects schema output and receives a search hit list.
-            // Better to let `ToolSearch` fail with "Unknown tool" so the
-            // model retries with the correct name.)
-            "WebSearch" | "web_search" => "websearch",
-            "WebFetch" | "web_fetch" => "webfetch",
             other => other,
         }
     }
@@ -535,31 +493,13 @@ impl Registry {
     pub async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let tools = self.tools.read().await;
         let resolved_name = Self::resolve_tool_name(name);
-        let tool = tools.get(resolved_name).cloned();
-
-        if tool.is_none() {
-            // Build an actionable error so the model retries with a real
-            // tool instead of giving up. Sonnet's prior often calls
-            // Claude-Code-style tool names that don't exist here; pointing
-            // it at the closest jcode equivalent gets it back on track.
-            let suggestion = Self::tool_name_suggestion(name);
-            let mut available: Vec<&str> = tools.keys().map(|s| s.as_str()).collect();
-            available.sort_unstable();
-            let listing = available.join(", ");
-            drop(tools);
-            return Err(anyhow::anyhow!(
-                "Unknown tool: {}.{} Available tools in this session: {}",
-                name,
-                suggestion,
-                listing
-            ));
-        }
-        let tool = tool.unwrap();
+        let tool = tools
+            .get(resolved_name)
+            .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?
+            .clone();
 
         // Drop the lock before executing
         drop(tools);
-
-        self.ensure_tool_permission(resolved_name, &input, &ctx)?;
 
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx).await;
@@ -573,69 +513,6 @@ impl Registry {
         output = self.guard_context_overflow(name, output).await;
 
         Ok(output)
-    }
-
-    fn ensure_tool_permission(&self, name: &str, input: &Value, ctx: &ToolContext) -> Result<()> {
-        let cfg = crate::config::Config::load();
-        let mode = cfg.safety.tool_permission_mode;
-        let Some(requirement) = crate::safety::tool_permission_requirement(
-            mode,
-            name,
-            input,
-            ctx.working_dir.as_deref(),
-        ) else {
-            return Ok(());
-        };
-
-        let safety = crate::safety::SafetySystem::new();
-        if safety.has_recent_tool_permission_approval(&requirement.fingerprint) {
-            return Ok(());
-        }
-
-        if let Some(pending) = safety.pending_tool_permission_request(&requirement.fingerprint) {
-            anyhow::bail!(
-                "Permission required for tool '{}': {}. Pending request id: {}. Run `jcode permissions` to approve or deny, then retry the tool call.",
-                name,
-                requirement.reason,
-                pending.id
-            );
-        }
-
-        let request_id = crate::safety::new_request_id();
-        let description = format!("Run tool '{}'", name);
-        let request = crate::safety::PermissionRequest {
-            id: request_id.clone(),
-            action: format!("tool:{}", name),
-            description: description.clone(),
-            rationale: requirement.reason.clone(),
-            urgency: crate::safety::Urgency::Normal,
-            wait: true,
-            created_at: chrono::Utc::now(),
-            context: Some(serde_json::json!({
-                "session_id": ctx.session_id.clone(),
-                "message_id": ctx.message_id.clone(),
-                "tool_call_id": ctx.tool_call_id.clone(),
-                "working_dir": ctx.working_dir.as_ref().map(|p| p.display().to_string()),
-                "tool_permission": {
-                    "mode": mode.as_str(),
-                    "tool": name,
-                    "input": input,
-                    "fingerprint": requirement.fingerprint.clone(),
-                    "reason": requirement.reason.clone(),
-                },
-                "review": {
-                    "summary": description,
-                    "why_permission_needed": requirement.reason.clone(),
-                }
-            })),
-        };
-        safety.request_permission(request);
-        anyhow::bail!(
-            "Permission required for tool '{}': {}. Queued request id: {}. Run `jcode permissions` to approve or deny, then retry the tool call.",
-            name,
-            requirement.reason,
-            request_id
-        )
     }
 
     /// Check if a tool output would overflow the context window and truncate if needed.

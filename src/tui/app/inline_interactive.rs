@@ -16,7 +16,8 @@ mod preview_request;
 use helpers::{
     agent_model_default_summary, agent_model_target_label, catchup_candidates,
     catchup_queue_position, model_entry_base_name, model_entry_saved_spec,
-    openrouter_route_model_id, picker_route_model_spec, save_agent_model_override,
+    openai_compatible_profile_id_for_route, openrouter_route_model_id, picker_route_model_spec,
+    save_agent_model_override,
 };
 
 impl App {
@@ -497,6 +498,7 @@ impl App {
                 "copilot" => 1,
                 "cursor" => 2,
                 "api-key" => 3,
+                method if method.starts_with("openai-compatible") => 3,
                 "openrouter" => 4,
                 _ => 5,
             };
@@ -1278,6 +1280,68 @@ impl App {
         }
     }
 
+    pub(super) fn handle_session_picker_current_terminal_selection(
+        &mut self,
+        targets: &[ResumeTarget],
+    ) {
+        let Some(target) = targets.first() else {
+            return;
+        };
+
+        let name = match target {
+            ResumeTarget::JcodeSession { session_id } => {
+                crate::id::extract_session_name(session_id)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| session_id.to_string())
+            }
+            ResumeTarget::ClaudeCodeSession { session_id, .. } => {
+                format!("Claude Code {}", &session_id[..session_id.len().min(8)])
+            }
+            ResumeTarget::CodexSession { session_id, .. } => {
+                format!("Codex {}", &session_id[..session_id.len().min(8)])
+            }
+            ResumeTarget::PiSession { session_path } => std::path::Path::new(session_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Pi session")
+                .to_string(),
+            ResumeTarget::OpenCodeSession { session_id, .. } => {
+                format!("OpenCode {}", &session_id[..session_id.len().min(8)])
+            }
+        };
+
+        let resolved_target = match crate::import::resolve_resume_target_to_jcode(target) {
+            Ok(target) => target,
+            Err(err) => {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Failed to import {}: {}",
+                    name, err
+                )));
+                return;
+            }
+        };
+
+        let ResumeTarget::JcodeSession { session_id } = resolved_target else {
+            self.push_display_message(DisplayMessage::error(format!(
+                "Cannot resume {} in the current terminal.",
+                name
+            )));
+            return;
+        };
+
+        if targets.len() > 1 {
+            self.push_display_message(DisplayMessage::system(format!(
+                "Selected {} sessions; resuming **{}** in this terminal.",
+                targets.len(),
+                name
+            )));
+        }
+        crate::tui::workspace_client::queue_resume_session(session_id);
+        self.session_picker_overlay = None;
+        self.session_picker_mode = SessionPickerMode::Resume;
+        self.set_status_notice(format!("Switching → {}", name));
+    }
+
     pub(super) fn handle_batch_crash_restore(&mut self) {
         let recovered = match crate::session::recover_crashed_sessions() {
             Ok(ids) => ids,
@@ -1372,11 +1436,15 @@ impl App {
                 self.session_picker_overlay = None;
                 self.session_picker_mode = SessionPickerMode::Resume;
             }
-            OverlayAction::Selected(PickerResult::Selected(ids)) => {
+            OverlayAction::Selected(PickerResult::Selected(ids))
+            | OverlayAction::Selected(PickerResult::SelectedInNewTerminal(ids)) => {
                 self.handle_session_picker_selection(&ids);
                 if let Some(picker_cell) = self.session_picker_overlay.as_ref() {
                     picker_cell.borrow_mut().clear_selected_sessions();
                 }
+            }
+            OverlayAction::Selected(PickerResult::SelectedInCurrentTerminal(ids)) => {
+                self.handle_session_picker_current_terminal_selection(&ids);
             }
             OverlayAction::Selected(PickerResult::RestoreAllCrashed) => {
                 self.handle_batch_crash_restore();
@@ -1515,6 +1583,8 @@ impl App {
                             format!("cursor:{}", bare_name)
                         } else if r.provider == "Antigravity" {
                             format!("antigravity:{}", bare_name)
+                        } else if openai_compatible_profile_id_for_route(r).is_some() {
+                            bare_name.clone()
                         } else if r.api_method == "openrouter" && r.provider != "auto" {
                             if bare_name.contains('/') {
                                 format!("{}@{}", bare_name, r.provider)
@@ -1536,7 +1606,10 @@ impl App {
                             "cursor" => Some("cursor"),
                             "cli" if r.provider == "Antigravity" => Some("antigravity"),
                             "openrouter" => Some("openrouter"),
-                            _ => None,
+                            method if method.starts_with("openai-compatible") => {
+                                openai_compatible_profile_id_for_route(r)
+                            }
+                            _ => openai_compatible_profile_id_for_route(r),
                         };
                         (spec, pkey)
                     } else {

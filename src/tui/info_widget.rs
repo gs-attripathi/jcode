@@ -85,6 +85,8 @@ pub enum WidgetKind {
     BackgroundTasks,
     /// 5-hour/weekly subscription bars
     UsageLimits,
+    /// Session-level KV cache hit ratio
+    KvCache,
     /// Current model name
     ModelInfo,
     /// Mermaid diagrams
@@ -107,13 +109,14 @@ impl WidgetKind {
             WidgetKind::Todos => 3,
             WidgetKind::ContextUsage => 4,
             WidgetKind::UsageLimits => 5, // Bumped up - important when near limits
-            WidgetKind::MemoryActivity => 6,
-            WidgetKind::ModelInfo => 7,
-            WidgetKind::BackgroundTasks => 8,
-            WidgetKind::GitStatus => 9,
-            WidgetKind::SwarmStatus => 10, // Session list - lower priority
-            WidgetKind::AmbientMode => 11, // Scheduled agent - lower priority
-            WidgetKind::Tips => 12,        // Did you know - lowest
+            WidgetKind::KvCache => 6,
+            WidgetKind::MemoryActivity => 7,
+            WidgetKind::ModelInfo => 8,
+            WidgetKind::BackgroundTasks => 9,
+            WidgetKind::GitStatus => 10,
+            WidgetKind::SwarmStatus => 11, // Session list - lower priority
+            WidgetKind::AmbientMode => 12, // Scheduled agent - lower priority
+            WidgetKind::Tips => 13,        // Did you know - lowest
         }
     }
 
@@ -130,6 +133,7 @@ impl WidgetKind {
             WidgetKind::BackgroundTasks => Side::Left,
             WidgetKind::AmbientMode => Side::Left,
             WidgetKind::UsageLimits => Side::Left,
+            WidgetKind::KvCache => Side::Left,
             WidgetKind::ModelInfo => Side::Left,
             WidgetKind::Tips => Side::Left,
             WidgetKind::GitStatus => Side::Left,
@@ -149,6 +153,7 @@ impl WidgetKind {
             WidgetKind::BackgroundTasks => 2,
             WidgetKind::AmbientMode => 3,
             WidgetKind::UsageLimits => 3,
+            WidgetKind::KvCache => 3,
             WidgetKind::ModelInfo => 3, // Model + usage bars
             WidgetKind::Tips => 3,
             WidgetKind::GitStatus => 3,
@@ -164,6 +169,7 @@ impl WidgetKind {
             WidgetKind::Todos,
             WidgetKind::ContextUsage,
             WidgetKind::UsageLimits,
+            WidgetKind::KvCache,
             WidgetKind::MemoryActivity,
             WidgetKind::ModelInfo,
             WidgetKind::BackgroundTasks,
@@ -186,6 +192,7 @@ impl WidgetKind {
             WidgetKind::BackgroundTasks => "background",
             WidgetKind::AmbientMode => "ambient",
             WidgetKind::UsageLimits => "usage",
+            WidgetKind::KvCache => "kv-cache",
             WidgetKind::ModelInfo => "model",
             WidgetKind::Tips => "tips",
             WidgetKind::GitStatus => "git",
@@ -218,6 +225,7 @@ pub(crate) fn is_overview_mergeable(kind: WidgetKind) -> bool {
             | WidgetKind::BackgroundTasks
             | WidgetKind::ModelInfo
             | WidgetKind::UsageLimits
+            | WidgetKind::KvCache
             | WidgetKind::GitStatus
     )
 }
@@ -345,6 +353,71 @@ pub struct UsageInfo {
     pub available: bool,
 }
 
+/// Session-level KV cache telemetry for providers that report cache usage.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CacheHitInfo {
+    /// Input tokens from completed API requests that included explicit cache telemetry.
+    pub reported_input_tokens: u64,
+    /// Tokens read from provider KV/prefix cache across this session.
+    pub read_tokens: u64,
+    /// Tokens written/created in provider cache across this session, when reported.
+    pub creation_tokens: u64,
+    /// Approximate reusable prefix tokens expected to be cache-readable.
+    pub optimal_input_tokens: u64,
+    /// Input tokens from the latest completed request with cache telemetry.
+    pub last_reported_input_tokens: Option<u64>,
+    /// Cached input tokens read on the latest completed request with cache telemetry.
+    pub last_read_tokens: Option<u64>,
+    /// Approximate reusable prefix tokens expected on the latest completed request.
+    pub last_optimal_input_tokens: Option<u64>,
+    /// Recent attributed misses with estimated cacheable tokens not read.
+    pub miss_attributions: Vec<CacheMissAttribution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheMissAttribution {
+    pub turn_number: usize,
+    pub call_index: u16,
+    pub missed_tokens: u64,
+    pub reason: String,
+}
+
+impl CacheHitInfo {
+    pub fn hit_ratio(&self) -> Option<f32> {
+        if self.reported_input_tokens == 0 {
+            None
+        } else {
+            Some((self.read_tokens as f32 / self.reported_input_tokens as f32).clamp(0.0, 1.0))
+        }
+    }
+
+    pub fn optimal_ratio(&self) -> Option<f32> {
+        if self.optimal_input_tokens == 0 {
+            None
+        } else {
+            Some((self.read_tokens as f32 / self.optimal_input_tokens as f32).clamp(0.0, 1.0))
+        }
+    }
+
+    pub fn last_ratio(&self) -> Option<f32> {
+        let input = self.last_reported_input_tokens?;
+        if input == 0 {
+            None
+        } else {
+            Some((self.last_read_tokens.unwrap_or(0) as f32 / input as f32).clamp(0.0, 1.0))
+        }
+    }
+
+    pub fn last_optimal_ratio(&self) -> Option<f32> {
+        let optimal = self.last_optimal_input_tokens?;
+        if optimal == 0 {
+            None
+        } else {
+            Some((self.last_read_tokens.unwrap_or(0) as f32 / optimal as f32).clamp(0.0, 1.0))
+        }
+    }
+}
+
 impl UsageInfo {
     /// Return the highest usage percentage across all limit windows (0-100).
     pub fn max_usage_pct(&self) -> u8 {
@@ -411,18 +484,7 @@ pub struct GraphEdge {
     pub kind: String,
 }
 
-/// Info about a mermaid diagram for display in the info widget
-#[derive(Debug, Clone)]
-pub struct DiagramInfo {
-    /// Hash for mermaid cache lookup
-    pub hash: u64,
-    /// Original PNG width
-    pub width: u32,
-    /// Original PNG height
-    pub height: u32,
-    /// Optional label/title
-    pub label: Option<String>,
-}
+pub use jcode_tui_mermaid::DiagramInfo;
 
 /// Git repository status for the info widget
 #[derive(Debug, Clone)]
@@ -508,6 +570,8 @@ pub struct InfoWidgetData {
     /// Actual API-reported context tokens (from last streaming response)
     /// When available, this is more accurate than the char-based estimate in context_info
     pub observed_context_tokens: Option<u64>,
+    /// Session-level cache read ratio, when the active provider reports cache telemetry.
+    pub cache_hit_info: Option<CacheHitInfo>,
     /// Whether background compaction is currently in progress
     pub is_compacting: bool,
     /// Git repository status
@@ -578,6 +642,9 @@ impl InfoWidgetData {
                 {
                     sections += 1;
                 }
+                if self.cache_hit_info.is_some() {
+                    sections += 1;
+                }
                 if self
                     .git_info
                     .as_ref()
@@ -612,6 +679,7 @@ impl InfoWidgetData {
                 .as_ref()
                 .map(|u| u.available)
                 .unwrap_or(false),
+            WidgetKind::KvCache => self.cache_hit_info.is_some(),
             WidgetKind::ModelInfo => self.model.is_some(),
             WidgetKind::Tips => false,
             WidgetKind::GitStatus => self
@@ -886,6 +954,18 @@ pub(crate) fn calculate_widget_height(
             } else {
                 0
             }
+        }
+        WidgetKind::KvCache => {
+            let Some(cache) = data.cache_hit_info.as_ref() else {
+                return 0;
+            };
+            let attribution_lines = if cache.miss_attributions.is_empty() {
+                2
+            } else {
+                let visible = cache.miss_attributions.len().min(5) as u16;
+                2 + visible + u16::from(cache.miss_attributions.len() > 5)
+            };
+            1 + attribution_lines
         }
         WidgetKind::ModelInfo => {
             if data.model.is_none() {
@@ -1296,9 +1376,163 @@ fn render_widget_content(
         WidgetKind::BackgroundTasks => render_background_widget(data, inner),
         WidgetKind::AmbientMode => render_ambient_widget(data, inner),
         WidgetKind::UsageLimits => render_usage_widget(data, inner),
+        WidgetKind::KvCache => render_kv_cache_widget(data, inner),
         WidgetKind::ModelInfo => render_model_widget(data, inner),
         WidgetKind::Tips => render_tips_widget(inner),
         WidgetKind::GitStatus => render_git_widget(data, inner),
+    }
+}
+
+fn render_kv_cache_widget(data: &InfoWidgetData, _inner: Rect) -> Vec<Line<'static>> {
+    let Some(cache) = data.cache_hit_info.as_ref() else {
+        return Vec::new();
+    };
+    let mut lines = vec![render_kv_cache_summary_line(cache)];
+
+    lines.push(Line::from(vec![Span::styled(
+        "miss attribution",
+        Style::default().fg(rgb(140, 140, 150)).bold(),
+    )]));
+
+    if cache.miss_attributions.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "none",
+            Style::default().fg(rgb(110, 210, 140)),
+        )]));
+        return lines;
+    }
+
+    let total_missed: u64 = cache
+        .miss_attributions
+        .iter()
+        .map(|sample| sample.missed_tokens)
+        .sum();
+    lines.push(Line::from(vec![Span::styled(
+        format!("{} missed total", compact_token_count(total_missed)),
+        Style::default().fg(rgb(180, 180, 190)),
+    )]));
+
+    for sample in cache.miss_attributions.iter().take(5) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format_cache_turn_label(sample.turn_number, sample.call_index),
+                Style::default().fg(rgb(140, 180, 255)).bold(),
+            ),
+            Span::styled(
+                format!(" {} miss ", compact_token_count(sample.missed_tokens)),
+                Style::default().fg(rgb(255, 200, 100)),
+            ),
+            Span::styled(
+                format!("({})", sample.reason),
+                Style::default().fg(rgb(140, 140, 150)),
+            ),
+        ]));
+    }
+
+    if cache.miss_attributions.len() > 5 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("… {} more", cache.miss_attributions.len() - 5),
+            Style::default().fg(rgb(100, 100, 110)),
+        )]));
+    }
+
+    lines
+}
+
+fn render_kv_cache_summary_line(cache: &CacheHitInfo) -> Line<'static> {
+    let Some(lifetime_ratio) = cache.hit_ratio() else {
+        return Line::default();
+    };
+
+    let lifetime_pct = ratio_pct(lifetime_ratio);
+    let warm_pct = cache.optimal_ratio().map(ratio_pct);
+    let last_pct = cache.last_ratio().map(ratio_pct);
+    let last_optimal_pct = cache.last_optimal_ratio().map(ratio_pct);
+    let health_pct = last_optimal_pct
+        .or(last_pct)
+        .or(warm_pct)
+        .unwrap_or(lifetime_pct);
+    let color = kv_cache_optimal_color(health_pct);
+
+    let mut spans = vec![Span::styled(
+        "KV cache: ",
+        Style::default().fg(rgb(180, 180, 190)).bold(),
+    )];
+
+    if let Some(warm_pct) = warm_pct {
+        spans.push(Span::styled(
+            "warm ",
+            Style::default().fg(rgb(140, 140, 150)),
+        ));
+        spans.push(Span::styled(
+            format!("{}%", warm_pct),
+            Style::default().fg(color).bold(),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "warming",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if let Some(last_pct) = last_pct {
+        spans.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 90))));
+        spans.push(Span::styled(
+            "last ",
+            Style::default().fg(rgb(140, 140, 150)),
+        ));
+        spans.push(Span::styled(
+            format!("{}%", last_pct),
+            Style::default().fg(color).bold(),
+        ));
+    }
+
+    spans.push(Span::styled(" · ", Style::default().fg(rgb(80, 80, 90))));
+    spans.push(Span::styled(
+        "all ",
+        Style::default().fg(rgb(140, 140, 150)),
+    ));
+    spans.push(Span::styled(
+        format!("{}%", lifetime_pct),
+        Style::default().fg(color).bold(),
+    ));
+
+    spans.push(Span::styled(
+        " lifetime",
+        Style::default().fg(rgb(100, 100, 110)),
+    ));
+
+    Line::from(spans)
+}
+
+fn ratio_pct(ratio: f32) -> u8 {
+    (ratio * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+fn kv_cache_optimal_color(pct: u8) -> Color {
+    match pct {
+        0..=24 => rgb(255, 110, 110),
+        25..=59 => rgb(255, 200, 100),
+        60..=84 => rgb(140, 180, 255),
+        _ => rgb(110, 210, 140),
+    }
+}
+
+fn format_cache_turn_label(turn_number: usize, call_index: u16) -> String {
+    if call_index <= 1 {
+        format!("{}>", turn_number)
+    } else {
+        format!("{}.{}>", turn_number, call_index)
+    }
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f32 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f32 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -1556,6 +1790,10 @@ fn render_sections(
         && info.available
     {
         lines.extend(render_usage_compact(info, inner.width));
+    }
+
+    if let Some(cache) = data.cache_hit_info.as_ref() {
+        lines.push(render_kv_cache_summary_line(cache));
     }
 
     // Git info
