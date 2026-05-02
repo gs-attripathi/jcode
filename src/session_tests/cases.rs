@@ -1070,3 +1070,35 @@ fn leaves_excludes_system_notes_and_active_real_leaf_walks_through_them() {
     let real = session.active_real_leaf().expect("active leaf");
     assert_eq!(real.id, leaf_a);
 }
+
+#[test]
+fn ensure_active_leaf_backfilled_prevents_history_loss_on_load() {
+    // Reproduces a real bug: when a session was loaded from snapshot
+    // (load_from_path / load_for_remote_startup / session_from_remote_startup_snapshot)
+    // without setting active_leaf_id, the next append_stored_message would
+    // wire the new message's parent_id to None and advance the leaf to it,
+    // making active_path() return only the new message and visually wiping
+    // all prior history.
+    let mut session = Session::create(None, None);
+    let m1 = session.add_message(Role::User, vec![ContentBlock::Text { text: "old1".into(), cache_control: None }]);
+    let m2 = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "old2".into(), cache_control: None }]);
+
+    // Simulate the load-from-snapshot anti-pattern: messages assigned
+    // directly without active_leaf_id being set.
+    session.active_leaf_id = None;
+    let preserved_messages = session.messages.clone();
+    let _ = preserved_messages; // documentation: messages stay; only the leaf was lost
+
+    // Apply the load-finalize step we now run on every load path.
+    session.ensure_active_leaf_backfilled();
+    assert_eq!(
+        session.active_leaf_id.as_deref(),
+        Some(m2.as_str()),
+        "backfill should anchor leaf to last message"
+    );
+
+    // Now appending a new message keeps the chain intact.
+    let m3 = session.add_message(Role::User, vec![ContentBlock::Text { text: "new1".into(), cache_control: None }]);
+    let path: Vec<&str> = session.active_path().iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(path, vec![m1.as_str(), m2.as_str(), m3.as_str()]);
+}

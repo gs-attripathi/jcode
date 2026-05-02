@@ -319,6 +319,7 @@ impl Session {
         session.replay_events.clear();
         session.env_snapshots.clear();
         session.memory_injections.clear();
+        session.ensure_active_leaf_backfilled();
         session.mark_memory_profile_dirty();
         session.reset_persist_state(true);
         session.reset_provider_messages_cache();
@@ -693,6 +694,7 @@ impl Session {
         }
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
+        session.ensure_active_leaf_backfilled();
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
@@ -1041,6 +1043,7 @@ impl Session {
         }
         let journal_ms = journal_start.elapsed().as_millis();
         let finalize_start = Instant::now();
+        session.ensure_active_leaf_backfilled();
         session.reset_persist_state(path.exists());
         session.reset_provider_messages_cache();
         session.mark_memory_profile_dirty();
@@ -1389,6 +1392,21 @@ impl Session {
             // Re-anchor the active leaf to whatever survived the truncation
             // so `active_path()` doesn't dangle on a deleted id.
             self.active_leaf_id = self.messages.last().map(|m| m.id.clone());
+        }
+    }
+
+    /// Backfill `active_leaf_id` to the last message's id when it's unset
+    /// but messages exist. Called by every session load path so that the
+    /// next `append_stored_message` correctly chains its `parent_id` from
+    /// the existing tail instead of treating the new message as a root —
+    /// otherwise `active_path()` walks back from the new message, finds
+    /// `parent_id = None`, and returns just that one message, making all
+    /// prior history vanish from rendering and provider context.
+    pub fn ensure_active_leaf_backfilled(&mut self) {
+        if self.active_leaf_id.is_none()
+            && let Some(last) = self.messages.last()
+        {
+            self.active_leaf_id = Some(last.id.clone());
         }
     }
 
