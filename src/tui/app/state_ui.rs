@@ -1276,11 +1276,15 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
 
         let mut info = String::new();
         info.push_str(&format!("**Version:** {}\n", version));
-        info.push_str(&format!(
-            "**Session:** {} ({})\n",
-            app.session.short_name.as_deref().unwrap_or("unnamed"),
-            &app.session.id[..8]
-        ));
+        // In remote mode `app.session.id` is the TUI's local placeholder
+        // (it picks its own animal name); the actual server-side session id
+        // is in `remote_session_id`. Show whichever is authoritative for
+        // this connection so the user sees the real id (the one in
+        // `~/.jcode/sessions/<id>.json`) and can grep for it.
+        let session_id_for_info = app
+            .active_client_session_id()
+            .unwrap_or(app.session.id.as_str());
+        info.push_str(&format!("**Session:** {}\n", session_id_for_info));
         info.push_str(&format!(
             "**Duration:** {} ({} turns)\n",
             duration_str, turn_count
