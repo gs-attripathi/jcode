@@ -483,6 +483,21 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Ask the server to switch the active branch tip to a leaf identified
+    /// by short id suffix. Server resolves the short id, moves the leaf,
+    /// and re-sends the history (same flow as rewind).
+    pub async fn checkout(&mut self, target: &str) -> Result<u64> {
+        let id = self.next_request_id;
+        let request = Request::Checkout {
+            id,
+            target: target.to_string(),
+        };
+        self.next_request_id += 1;
+        self.has_loaded_history = false;
+        self.send_request(request).await?;
+        Ok(id)
+    }
+
     /// Cycle the active model on the server
     pub async fn cycle_model(&mut self, direction: i8) -> Result<()> {
         let request = Request::CycleModel {

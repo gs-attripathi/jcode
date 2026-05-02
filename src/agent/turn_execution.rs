@@ -153,6 +153,38 @@ impl Agent {
         self.persist_session_best_effort("provider session reset");
     }
 
+    /// Read-only view of the underlying session for tree introspection
+    /// (`leaves()`, `find_message_by_short_id`, etc.).
+    pub fn session_ref(&self) -> &crate::session::Session {
+        &self.session
+    }
+
+    /// Switch the active branch tip to `leaf_id`. Caller must have validated
+    /// that the id refers to a real message in this session. Resets the
+    /// provider session id so the next API call rebuilds context for the
+    /// newly-active branch.
+    pub fn checkout_active_leaf(&mut self, leaf_id: String) {
+        self.session.set_active_leaf(leaf_id);
+        self.provider_session_id = None;
+        self.session.provider_session_id = None;
+        self.persist_session_best_effort("checkout");
+    }
+
+    /// Append a UI/navigation note to the active branch and persist. Used by
+    /// /rewind and /checkout so the user can see in scroll-back what they
+    /// did to navigate the tree.
+    pub fn record_system_note(&mut self, text: impl Into<String>) {
+        self.session.add_system_note(text);
+        self.persist_session_best_effort("system_note");
+    }
+
+    /// Record a user-typed slash command (e.g. "/rewind 1") on the active
+    /// branch so it shows up in scroll-back styled as a user message.
+    pub fn record_user_command(&mut self, text: impl Into<String>) {
+        self.session.add_user_command(text);
+        self.persist_session_best_effort("user_command");
+    }
+
     /// Rewind the conversation to a 1-based visible conversation message index.
     ///
     /// Provider-side resumable sessions are reset so the next request sends the

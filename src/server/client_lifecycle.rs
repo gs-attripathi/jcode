@@ -1393,7 +1393,18 @@ pub(super) async fn handle_client(
 
                 let rewind_result = {
                     let mut agent_guard = agent.lock().await;
-                    agent_guard.rewind_to_message(message_index)
+                    let result = agent_guard.rewind_to_message(message_index);
+                    if let Ok(removed) = &result {
+                        // Tree-tree-aware extras: record the typed command
+                        // and the system reply so they show up in
+                        // scroll-back styled like a chat exchange.
+                        agent_guard.record_user_command(format!("/rewind {message_index}"));
+                        agent_guard.record_system_note(format!(
+                            "✓ Rewound to message {message_index}. Removed {removed} message{}.",
+                            if *removed == 1 { "" } else { "s" }
+                        ));
+                    }
+                    result
                 };
 
                 match rewind_result {
@@ -1402,6 +1413,82 @@ pub(super) async fn handle_client(
                             "Rewound session {} to message {} (removed {})",
                             client_session_id, message_index, removed
                         ));
+                        if handle_get_history(
+                            id,
+                            &client_session_id,
+                            client_is_processing,
+                            &agent,
+                            &provider,
+                            &sessions,
+                            &client_connections,
+                            &client_count,
+                            &writer,
+                            &server_name,
+                            &server_icon,
+                            None,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(message) => {
+                        let _ = client_event_tx.send(ServerEvent::Error {
+                            id,
+                            message,
+                            retry_after_secs: None,
+                        });
+                    }
+                }
+            }
+
+            Request::Checkout { id, target } => {
+                if client_is_processing {
+                    let _ = client_event_tx.send(ServerEvent::Error {
+                        id,
+                        message: "Cannot checkout a branch while a turn is processing."
+                            .to_string(),
+                        retry_after_secs: None,
+                    });
+                    continue;
+                }
+
+                let resolved = {
+                    let mut agent_guard = agent.lock().await;
+                    let target_id = agent_guard
+                        .session_ref()
+                        .find_message_by_short_id(&target)
+                        .map(|m| m.id.clone());
+                    match target_id {
+                        Some(id) => {
+                            let leaf_ids: std::collections::HashSet<String> = agent_guard
+                                .session_ref()
+                                .leaves()
+                                .iter()
+                                .map(|m| m.id.clone())
+                                .collect();
+                            if !leaf_ids.contains(&id) {
+                                Err("Target is not a branch tip — /checkout currently only accepts leaf ids."
+                                    .to_string())
+                            } else {
+                                let short = crate::session::Session::short_id(&id);
+                                agent_guard.record_user_command(format!("/checkout @{}", short));
+                                agent_guard.checkout_active_leaf(id.clone());
+                                agent_guard
+                                    .record_system_note(format!("✓ Switched to branch `@{}`.", short));
+                                Ok(())
+                            }
+                        }
+                        None => Err(format!(
+                            "No unique branch matches `{}`. Run /branches to list leaves.",
+                            target
+                        )),
+                    }
+                };
+
+                match resolved {
+                    Ok(()) => {
                         if handle_get_history(
                             id,
                             &client_session_id,

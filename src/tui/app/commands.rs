@@ -1271,6 +1271,108 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    // In remote mode the live session is owned by the server; let the
+    // remote dispatcher in remote/key_handling.rs send the RPC. Otherwise
+    // this local handler would mutate only the TUI's mirror.
+    if app.is_remote && trimmed.starts_with("/checkout ") {
+        return false;
+    }
+
+    if trimmed == "/branches" {
+        // Read session state straight from disk — works in both standalone
+        // and remote mode. In remote, app.session.messages is empty (the
+        // live state lives on the server) so disk is the source of truth.
+        let lookup_id = app
+            .active_client_session_id()
+            .unwrap_or(app.session.id.as_str())
+            .to_string();
+        let snapshot = if app.session.messages.is_empty() {
+            crate::session::Session::load(&lookup_id).ok()
+        } else {
+            None
+        };
+        let session_ref = snapshot.as_ref().unwrap_or(&app.session);
+
+        let leaves = session_ref.leaves();
+        if leaves.is_empty() {
+            app.push_display_message(DisplayMessage::system(
+                "No branches yet — start chatting to create one.".to_string(),
+            ));
+            return true;
+        }
+        let active = session_ref.active_real_leaf().map(|m| m.id.clone());
+        let mut sorted: Vec<&crate::session::StoredMessage> = leaves;
+        sorted.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
+
+        let mut output = format!("**Branches ({}, current marked ●):**\n\n", sorted.len());
+        for leaf in &sorted {
+            let is_active = active.as_deref() == Some(leaf.id.as_str());
+            let marker = if is_active { "●" } else { " " };
+            let label = leaf_label(session_ref, leaf, 40);
+            let short = crate::session::Session::short_id(&leaf.id);
+            output.push_str(&format!("  {} `@{}`  {}\n", marker, short, label));
+        }
+        output.push_str("\nUse `/checkout @<short-id>` to switch branches.");
+        app.push_display_message(DisplayMessage::system(output));
+        return true;
+    }
+
+    if let Some(arg) = trimmed.strip_prefix("/checkout ") {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            app.push_display_message(DisplayMessage::error(
+                "Usage: `/checkout @<short-id>`. Run `/branches` to list leaves.".to_string(),
+            ));
+            return true;
+        }
+        // Standalone-mode checkout: mutate locally. Remote mode bails above.
+        let target_id = match app.session.find_message_by_short_id(arg) {
+            Some(m) => m.id.clone(),
+            None => {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "No unique branch matches `{}`. Run `/branches` to list leaves.",
+                    arg
+                )));
+                return true;
+            }
+        };
+
+        let leaf_ids: std::collections::HashSet<String> =
+            app.session.leaves().iter().map(|m| m.id.clone()).collect();
+        if !leaf_ids.contains(&target_id) {
+            app.push_display_message(DisplayMessage::error(
+                "Target is not a branch tip. /checkout currently only accepts leaf ids.".to_string(),
+            ));
+            return true;
+        }
+
+        let short = crate::session::Session::short_id(&target_id);
+        app.session
+            .add_user_command(format!("/checkout @{}", short));
+        app.session.set_active_leaf(target_id.clone());
+        app.session
+            .add_system_note(format!("✓ Switched to branch `@{}`.", short));
+
+        let provider_messages = app.session.messages_for_provider_uncached();
+        app.replace_provider_messages(provider_messages);
+        app.session.updated_at = chrono::Utc::now();
+        app.clear_display_messages();
+        for rendered in crate::session::render_messages(&app.session) {
+            app.push_display_message(DisplayMessage {
+                role: rendered.role,
+                content: rendered.content,
+                tool_calls: rendered.tool_calls,
+                duration_secs: None,
+                title: None,
+                tool_data: rendered.tool_data,
+            });
+        }
+        app.provider_session_id = None;
+        app.session.provider_session_id = None;
+        let _ = app.session.save();
+        return true;
+    }
+
     if trimmed == "/rewind undo" {
         let Some(snapshot) = app.rewind_undo_snapshot.take() else {
             app.push_display_message(DisplayMessage::system("No rewind to undo.".to_string()));
@@ -2098,6 +2200,37 @@ pub(super) fn handle_feedback_command(app: &mut App, trimmed: &str) -> bool {
 
 pub(super) fn handle_dev_command(app: &mut App, trimmed: &str) -> bool {
     super::tui_lifecycle_runtime::handle_dev_command(app, trimmed)
+}
+
+/// Label a tree leaf with the most recent user prompt's text on its path,
+/// truncated to `max_chars`. Falls back to "<no prompt>" if walking back
+/// from the leaf finds no user-typed message.
+fn leaf_label(
+    session: &crate::session::Session,
+    leaf: &crate::session::StoredMessage,
+    max_chars: usize,
+) -> String {
+    use crate::message::ContentBlock;
+    let by_id: std::collections::HashMap<&str, &crate::session::StoredMessage> = session
+        .messages
+        .iter()
+        .map(|m| (m.id.as_str(), m))
+        .collect();
+    let mut cur: Option<&crate::session::StoredMessage> = Some(leaf);
+    while let Some(node) = cur {
+        if matches!(node.role, crate::message::Role::User) && node.display_role.is_none() {
+            for block in &node.content {
+                if let ContentBlock::Text { text, .. } = block {
+                    let s = text.trim();
+                    if !s.is_empty() {
+                        return crate::util::truncate_str(s, max_chars).to_string();
+                    }
+                }
+            }
+        }
+        cur = node.parent_id.as_deref().and_then(|p| by_id.get(p).copied());
+    }
+    "<no prompt>".to_string()
 }
 
 #[cfg(test)]

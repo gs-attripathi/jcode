@@ -125,6 +125,19 @@ async fn handle_remote_rewind_command(
         return Ok(true);
     }
 
+    if let Some(target) = trimmed.strip_prefix("/checkout ") {
+        let target = target.trim().trim_start_matches('@');
+        if target.is_empty() {
+            app.push_display_message(DisplayMessage::error(
+                "Usage: `/checkout @<short-id>`. Run `/branches` to list leaves.".to_string(),
+            ));
+        } else {
+            remote.checkout(target).await?;
+            app.set_status_notice(format!("Switching to branch @{target}..."));
+        }
+        return Ok(true);
+    }
+
     let Some(num_str) = trimmed.strip_prefix("/rewind ") else {
         return Ok(false);
     };

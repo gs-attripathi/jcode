@@ -112,6 +112,13 @@ pub enum Request {
     #[serde(rename = "rewind_undo")]
     RewindUndo { id: u64 },
 
+    /// Switch the active branch tip to a different leaf in the conversation
+    /// tree. `target` is a short id suffix (the last few chars of a message
+    /// id); the server resolves it against its leaves and re-sends the new
+    /// active history via the standard `get_history` flow.
+    #[serde(rename = "checkout")]
+    Checkout { id: u64, target: String },
+
     /// Health check
     #[serde(rename = "ping")]
     Ping { id: u64 },
@@ -1340,6 +1347,7 @@ impl Request {
             Request::Clear { id } => *id,
             Request::Rewind { id, .. } => *id,
             Request::RewindUndo { id } => *id,
+            Request::Checkout { id, .. } => *id,
             Request::Ping { id } => *id,
             Request::GetState { id } => *id,
             Request::DebugCommand { id, .. } => *id,
