@@ -295,6 +295,8 @@ fn make_provider() -> OpenRouterProvider {
         provider_routing: Arc::new(RwLock::new(ProviderRouting::default())),
         provider_pin: Arc::new(Mutex::new(None)),
         endpoints_cache: Arc::new(RwLock::new(HashMap::new())),
+    profile_id: None,
+    static_context_limits: HashMap::new(),
     }
 }
 
@@ -317,6 +319,8 @@ fn make_custom_compatible_provider() -> OpenRouterProvider {
         provider_routing: Arc::new(RwLock::new(ProviderRouting::default())),
         provider_pin: Arc::new(Mutex::new(None)),
         endpoints_cache: Arc::new(RwLock::new(HashMap::new())),
+    profile_id: None,
+    static_context_limits: HashMap::new(),
     }
 }
 

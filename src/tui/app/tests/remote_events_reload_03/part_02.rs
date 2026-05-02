@@ -23,6 +23,7 @@ fn test_metadata_only_history_preserves_fast_restored_startup_state() {
         timestamp: None,
         tool_duration_ms: None,
         token_usage: None,
+        parent_id: None,
     });
     session.save().expect("save fast resume session");
 

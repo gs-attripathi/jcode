@@ -1025,3 +1025,48 @@ fn rewind_via_active_leaf_preserves_storage_so_branch_can_resurface() {
     assert_eq!(session.active_path().len(), 3);
     assert_eq!(session.messages.len(), 7);
 }
+
+#[test]
+fn leaves_excludes_system_notes_and_active_real_leaf_walks_through_them() {
+    // Build root → asst → user "branch A" → asst (leaf A)
+    //              ↘ user "branch B" → asst (leaf B)
+    // Then /checkout @leafA which appends a UserCommand + System note as
+    // children of leafA. leaves() should still return exactly leafA and
+    // leafB (not the navigation notes), and active_real_leaf() should
+    // resolve back to leafA even though active_leaf_id points at the
+    // system note.
+    let mut session = Session::create(None, None);
+    let _root = session.add_message(Role::User, vec![ContentBlock::Text { text: "root".into(), cache_control: None }]);
+    let asst = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "asst".into(), cache_control: None }]);
+
+    let _user_a = session.add_message(Role::User, vec![ContentBlock::Text { text: "branch A".into(), cache_control: None }]);
+    let leaf_a = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "A reply".into(), cache_control: None }]);
+
+    // Move back to asst and create branch B as a sibling.
+    session.set_active_leaf(asst.clone());
+    let _user_b = session.add_message(Role::User, vec![ContentBlock::Text { text: "branch B".into(), cache_control: None }]);
+    let leaf_b = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "B reply".into(), cache_control: None }]);
+
+    // Two real leaves.
+    let leaf_ids: Vec<&str> = session.leaves().iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(leaf_ids.len(), 2);
+    assert!(leaf_ids.contains(&leaf_a.as_str()));
+    assert!(leaf_ids.contains(&leaf_b.as_str()));
+
+    // Simulate /checkout @leafA by moving leaf and appending nav notes.
+    session.set_active_leaf(leaf_a.clone());
+    let _cmd = session.add_user_command("/checkout @abcd");
+    let _note = session.add_system_note("✓ Switched to branch `@abcd`.");
+
+    // leaves() must still return exactly two real tips, not the new
+    // navigation entries.
+    let leaf_ids_after: Vec<String> = session.leaves().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(leaf_ids_after.len(), 2);
+    assert!(leaf_ids_after.contains(&leaf_a));
+    assert!(leaf_ids_after.contains(&leaf_b));
+
+    // active_real_leaf walks past the system/user-command notes back to
+    // the conversation message the user thinks of as "the tip".
+    let real = session.active_real_leaf().expect("active leaf");
+    assert_eq!(real.id, leaf_a);
+}

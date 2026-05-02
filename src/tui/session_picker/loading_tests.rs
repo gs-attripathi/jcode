@@ -253,6 +253,7 @@ fn session_matches_query_searches_jcode_transcript_contents() {
         timestamp: None,
         tool_duration_ms: None,
         token_usage: None,
+        parent_id: None,
     });
     session.save().expect("save session");
 
@@ -326,6 +327,7 @@ fn benchmark_resume_loading_reports_timings() {
             timestamp: None,
             tool_duration_ms: None,
             token_usage: None,
+            parent_id: None,
         });
         session.append_stored_message(crate::session::StoredMessage {
             id: format!("msg-{idx}-2"),
@@ -338,6 +340,7 @@ fn benchmark_resume_loading_reports_timings() {
             timestamp: None,
             tool_duration_ms: None,
             token_usage: None,
+            parent_id: None,
         });
         session.save().expect("save benchmark session");
     }
