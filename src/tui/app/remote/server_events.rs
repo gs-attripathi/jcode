@@ -594,6 +594,15 @@ pub(in crate::tui::app) fn handle_server_event(
             }
 
             let should_apply_history_payload = session_changed || !remote.has_loaded_history();
+            crate::logging::info(&format!(
+                "history_event: session={}, session_changed={}, has_loaded_history={}, should_apply={}, payload_messages={}, display_messages_before={}",
+                session_id,
+                session_changed,
+                remote.has_loaded_history(),
+                should_apply_history_payload,
+                history_message_count,
+                app.display_messages().len(),
+            ));
             if should_apply_history_payload {
                 if let Some(activity) = activity.filter(|activity| activity.is_processing) {
                     let current_tool_name = activity.current_tool_name.clone();

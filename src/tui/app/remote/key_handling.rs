@@ -16,6 +16,12 @@ pub(in crate::tui::app) async fn send_interleave_now(
     if content.trim().is_empty() {
         return;
     }
+    // Mirror the prompt into the display *before* sending, so the user's
+    // chat shows what they typed regardless of how the message is routed
+    // (Submit / Interleave). Without this, an Enter that lands while
+    // `is_processing` is still flipping false routes through Interleave
+    // and the prompt vanishes from view even though the server got it.
+    app.push_display_message(DisplayMessage::user(content.clone()));
     let msg_clone = content.clone();
     match remote.soft_interrupt(content, false).await {
         Err(e) => {
