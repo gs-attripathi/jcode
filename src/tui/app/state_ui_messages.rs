@@ -48,6 +48,11 @@ impl App {
             messages.len(),
         ));
         self.display_messages = messages;
+        // Body cache holds rendered prefixes keyed by msg_count + layout
+        // params (no message-identity check). Wholesale replacement makes
+        // those prefixes stale even though their key still matches —
+        // wipe the cache so the next frame re-renders from scratch.
+        crate::tui::clear_body_cache();
         self.sync_compacted_history_lazy_from_display_messages();
         self.bump_display_messages_version();
         self.note_runtime_memory_event_force("display_messages_replaced", "display_history_reset");
@@ -237,6 +242,10 @@ impl App {
                 self.display_messages.len()
             ));
             self.display_messages.clear();
+            // Same reason as replace_display_messages: drop cached
+            // prefixes that would otherwise be reused as a stale base
+            // for the rebuilt display.
+            crate::tui::clear_body_cache();
             self.bump_display_messages_version();
         }
     }

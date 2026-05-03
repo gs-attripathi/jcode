@@ -1182,6 +1182,7 @@ pub use ui::{
     SidePanelMermaidProbe, SidePanelMermaidProbeRect, debug_probe_pinned_diagram,
     debug_probe_side_panel_mermaid,
 };
+pub(crate) use ui::clear_body_cache;
 
 pub fn display_messages_from_session(session: &crate::session::Session) -> Vec<DisplayMessage> {
     let mut messages: Vec<DisplayMessage> = crate::session::render_messages(session)

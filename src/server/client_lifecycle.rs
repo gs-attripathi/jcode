@@ -1391,20 +1391,31 @@ pub(super) async fn handle_client(
                     continue;
                 }
 
-                let rewind_result = {
+                let rewind_result: Result<usize, String> = {
                     let mut agent_guard = agent.lock().await;
-                    let result = agent_guard.rewind_to_message(message_index);
-                    if let Ok(removed) = &result {
-                        // Tree-tree-aware extras: record the typed command
-                        // and the system reply so they show up in
-                        // scroll-back styled like a chat exchange.
-                        agent_guard.record_user_command(format!("/rewind {message_index}"));
-                        agent_guard.record_system_note(format!(
-                            "✓ Rewound to message {message_index}. Removed {removed} message{}.",
-                            if *removed == 1 { "" } else { "s" }
-                        ));
+                    // Non-destructive, prompt-counting semantics: /rewind N
+                    // keeps the first N user prompts AND their replies, and
+                    // moves the active leaf back. The dropped suffix is
+                    // preserved on disk so /branches sees it as a sibling.
+                    // (Upstream's destructive rewind_to_message + snapshot
+                    // undo is bypassed here — the tree itself is the undo.)
+                    match agent_guard.rewind_to_prompt(message_index) {
+                        Some((_kept, removed)) => {
+                            agent_guard.record_user_command(format!(
+                                "/rewind {message_index}"
+                            ));
+                            agent_guard.record_system_note(format!(
+                                "✓ Rewound to keep first {message_index} prompt{}. Dropped {removed} message{} into a sibling branch — use `/branches` to see them, `/checkout @<id>` to switch.",
+                                if message_index == 1 { "" } else { "s" },
+                                if removed == 1 { "" } else { "s" },
+                            ));
+                            Ok(removed)
+                        }
+                        None => Err(format!(
+                            "Invalid prompt number: {}. Session has fewer prompts than that.",
+                            message_index
+                        )),
                     }
-                    result
                 };
 
                 match rewind_result {

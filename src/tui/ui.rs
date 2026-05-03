@@ -1100,6 +1100,21 @@ fn body_cache() -> &'static Mutex<BodyCacheState> {
     BODY_CACHE.get_or_init(|| Mutex::new(BodyCacheState::default()))
 }
 
+/// Drop every cached body-render entry. Called when display_messages is
+/// non-incrementally rewritten (clear / replace) — the incremental-base
+/// optimization in `take_best_incremental_base` matches purely on
+/// `msg_count` and layout params, NOT on message identity, so a leftover
+/// entry from a previous display state would be reused as the prefix and
+/// you'd see ghost messages from before the clear (e.g. the "Press Alt+;"
+/// startup hint reappearing in the position of a freshly-typed user
+/// prompt). Wiping the cache forces a fresh render on the next frame.
+pub(crate) fn clear_body_cache() {
+    if let Ok(mut cache) = body_cache().lock() {
+        cache.entries.clear();
+        cache.oversized_entries.clear();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FullPrepCacheKey {
     width: u16,

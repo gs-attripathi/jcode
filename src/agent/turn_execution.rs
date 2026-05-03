@@ -1,5 +1,18 @@
 use super::*;
 
+/// A "user prompt" is a Role::User stored message with a Text block and no
+/// `display_role` (which would mark it as system-reminder, UserCommand,
+/// etc.). Used by `rewind_to_prompt` to count and locate prompts on the
+/// active path.
+fn is_user_prompt(msg: &crate::session::StoredMessage) -> bool {
+    matches!(msg.role, Role::User)
+        && msg.display_role.is_none()
+        && msg
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { .. }))
+}
+
 impl Agent {
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
@@ -187,6 +200,43 @@ impl Agent {
 
     /// Rewind the conversation to a 1-based visible conversation message index.
     ///
+    /// Non-destructive, prompt-counting rewind. Keeps the first `prompt_n`
+    /// user prompts AND each one's full assistant turn, then moves the
+    /// active leaf back to that point. The dropped suffix is preserved on
+    /// disk so `/branches` sees it as a sibling — there's no separate undo
+    /// snapshot needed because the tree itself is the undo. Returns
+    /// `Some((kept_prompts, removed_messages))` on success or `None` if
+    /// `prompt_n` exceeds the total user prompts on the active path.
+    pub fn rewind_to_prompt(&mut self, prompt_n: usize) -> Option<(usize, usize)> {
+        if prompt_n == 0 {
+            return None;
+        }
+        let (new_leaf_id, removed) = {
+            let path = self.session.active_path();
+            let user_indices: Vec<usize> = path
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| if is_user_prompt(m) { Some(i) } else { None })
+                .collect();
+            let total_prompts = user_indices.len();
+            if prompt_n > total_prompts {
+                return None;
+            }
+            if prompt_n == total_prompts {
+                return Some((prompt_n, 0));
+            }
+            let drop_at = user_indices[prompt_n];
+            let new_leaf = path[drop_at - 1].id.clone();
+            let removed = path.len() - drop_at;
+            (new_leaf, removed)
+        };
+        self.session.set_active_leaf(new_leaf_id);
+        self.provider_session_id = None;
+        self.session.provider_session_id = None;
+        self.persist_session_best_effort("rewind_to_prompt");
+        Some((prompt_n, removed))
+    }
+
     /// Provider-side resumable sessions are reset so the next request sends the
     /// truncated context from scratch instead of continuing from a stale upstream
     /// conversation.

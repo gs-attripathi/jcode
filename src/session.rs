@@ -1421,11 +1421,13 @@ impl Session {
         self.mark_messages_full_dirty();
     }
 
-    /// All "real" branch tips: messages with no non-system children. System
-    /// notes (display_role = System or UserCommand) are navigation markers,
-    /// not branches in their own right, so they're skipped both as
-    /// candidates and when counting children. For a single-branch session
-    /// with no checkouts this returns just the last conversation message.
+    /// All "real" branch tips: messages with no non-system children, PLUS
+    /// the current `active_real_leaf` even if it has children. The latter
+    /// covers the post-`/rewind` case where the active leaf is now a fork
+    /// point with the dropped suffix hanging off it as a sibling — the
+    /// user thinks of that point as its own branch immediately, before
+    /// they type any new prompt. System notes / typed slash-command
+    /// records are skipped as candidates and as children.
     pub fn leaves(&self) -> Vec<&StoredMessage> {
         let real_parents: std::collections::HashSet<&str> = self
             .messages
@@ -1433,10 +1435,17 @@ impl Session {
             .filter(|m| m.display_role.is_none())
             .filter_map(|m| m.parent_id.as_deref())
             .collect();
-        self.messages
+        let mut tips: Vec<&StoredMessage> = self
+            .messages
             .iter()
             .filter(|m| m.display_role.is_none() && !real_parents.contains(m.id.as_str()))
-            .collect()
+            .collect();
+        if let Some(active) = self.active_real_leaf()
+            && !tips.iter().any(|m| m.id == active.id)
+        {
+            tips.push(active);
+        }
+        tips
     }
 
     /// Look up a message by a short id suffix (the last 4-8 chars of its
