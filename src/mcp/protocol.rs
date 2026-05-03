@@ -214,10 +214,31 @@ pub struct McpConfig {
 }
 
 impl McpConfig {
-    /// Load config from file
+    /// Load config from file. Each server entry is deserialized
+    /// independently so a single malformed entry (e.g. an HTTP-style
+    /// config when only stdio is supported) doesn't take down the rest.
+    /// Bad entries are logged and skipped; good entries still register.
     pub fn load_from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&content)?)
+        let raw: serde_json::Value = serde_json::from_str(&content)?;
+        let mut config = Self::default();
+        let Some(servers) = raw.get("servers").and_then(|v| v.as_object()) else {
+            return Ok(config);
+        };
+        for (name, entry) in servers {
+            match serde_json::from_value::<McpServerConfig>(entry.clone()) {
+                Ok(server) => {
+                    config.servers.insert(name.clone(), server);
+                }
+                Err(err) => {
+                    crate::logging::warn(&format!(
+                        "MCP config: skipping server '{}' — {}. Other servers will still load.",
+                        name, err
+                    ));
+                }
+            }
+        }
+        Ok(config)
     }
 
     /// Save config to a JSON file

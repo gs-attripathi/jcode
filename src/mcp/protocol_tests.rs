@@ -113,3 +113,31 @@ fn test_initialize_result() {
     assert_eq!(result.protocol_version, "2024-11-05");
     assert!(result.server_info.is_some());
 }
+
+#[test]
+fn test_mcp_config_load_tolerates_bad_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let content = r#"{
+        "servers": {
+            "good_one": {
+                "command": "uvx",
+                "args": ["--system-certs", "duckduckgo-mcp-server"]
+            },
+            "bad_http": {
+                "type": "http",
+                "url": "https://example.com/mcp"
+            },
+            "good_two": {
+                "command": "/bin/cat",
+                "args": []
+            }
+        }
+    }"#;
+    std::fs::write(&path, content).unwrap();
+    let config = McpConfig::load_from_file(&path).expect("should load despite bad entry");
+    assert_eq!(config.servers.len(), 2);
+    assert!(config.servers.contains_key("good_one"));
+    assert!(config.servers.contains_key("good_two"));
+    assert!(!config.servers.contains_key("bad_http"));
+}
