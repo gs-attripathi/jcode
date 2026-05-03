@@ -17,12 +17,14 @@ enum WidgetProviderKind {
 
 impl WidgetProviderKind {
     fn from_provider_key(raw: Option<&str>) -> Self {
-        match raw.map(|s| s.trim().to_ascii_lowercase()) {
+        match raw.map(|provider| provider.trim().to_ascii_lowercase()) {
             Some(provider) if provider == "openrouter" => Self::OpenRouter,
             Some(provider) if provider == "copilot" => Self::Copilot,
             Some(provider) if provider == "gemini" => Self::Gemini,
             Some(provider) if provider == "openai" => Self::OpenAI,
-            Some(provider) if provider == "claude" => Self::Anthropic,
+            Some(provider) if matches!(provider.as_str(), "anthropic" | "claude") => {
+                Self::Anthropic
+            }
             _ => Self::Unknown,
         }
     }
@@ -343,9 +345,9 @@ impl crate::tui::TuiState for App {
         if self.is_remote {
             self.remote_header_provider_name().unwrap_or_default()
         } else {
-            self.remote_provider_name
-                .clone()
-                .unwrap_or_else(|| self.provider.name().to_string())
+            self.remote_provider_name.clone().unwrap_or_else(|| {
+                crate::provider_catalog::runtime_provider_display_name(self.provider.name())
+            })
         }
     }
 
@@ -550,6 +552,10 @@ impl crate::tui::TuiState for App {
         })
     }
 
+    fn active_experimental_feature_notice(&self) -> Option<String> {
+        self.active_experimental_feature_notice.clone()
+    }
+
     fn remote_startup_phase_active(&self) -> bool {
         self.remote_startup_phase.is_some()
     }
@@ -616,6 +622,7 @@ impl crate::tui::TuiState for App {
         }
 
         let mut info = self.context_info.clone();
+        info.session_context_chars = 0;
 
         // Compute dynamic stats from conversation
         let mut user_chars = 0usize;
@@ -677,10 +684,19 @@ impl crate::tui::TuiState for App {
 
                 for block in &msg.content {
                     match block {
-                        ContentBlock::Text { text, .. } => match msg.role {
-                            Role::User => user_chars += text.len(),
-                            Role::Assistant => asst_chars += text.len(),
-                        },
+                        ContentBlock::Text { text, .. } => {
+                            if msg.role == Role::User
+                                && text.starts_with("<system-reminder>\n# Session Context")
+                            {
+                                info.session_context_chars += text.len();
+                                user_count = user_count.saturating_sub(1);
+                            } else {
+                                match msg.role {
+                                    Role::User => user_chars += text.len(),
+                                    Role::Assistant => asst_chars += text.len(),
+                                }
+                            }
+                        }
                         ContentBlock::ToolUse { name, input, .. } => {
                             tool_call_count += 1;
                             tool_call_chars += name.len() + input.to_string().len();
@@ -729,7 +745,7 @@ impl crate::tui::TuiState for App {
 
         // Update total
         info.total_chars = info.system_prompt_chars
-            + info.env_context_chars
+            + info.session_context_chars
             + info.project_agents_md_chars
             + info.global_agents_md_chars
             + info.skills_chars
@@ -961,6 +977,29 @@ impl crate::tui::TuiState for App {
             None
         };
 
+        let cache_hit_info = (self.total_cache_reported_input_tokens > 0).then(|| {
+            crate::tui::info_widget::CacheHitInfo {
+                reported_input_tokens: self.total_cache_reported_input_tokens,
+                read_tokens: self.total_cache_read_tokens,
+                creation_tokens: self.total_cache_creation_tokens,
+                optimal_input_tokens: self.total_cache_optimal_input_tokens,
+                last_reported_input_tokens: self.last_cache_reported_input_tokens,
+                last_read_tokens: self.last_cache_read_tokens,
+                last_optimal_input_tokens: self.last_cache_optimal_input_tokens,
+                miss_attributions: self
+                    .kv_cache_miss_samples
+                    .iter()
+                    .rev()
+                    .map(|sample| crate::tui::info_widget::CacheMissAttribution {
+                        turn_number: sample.turn_number,
+                        call_index: sample.call_index,
+                        missed_tokens: sample.missed_tokens,
+                        reason: sample.reason.label().to_string(),
+                    })
+                    .collect(),
+            }
+        });
+
         let auth_method = self.widget_auth_method(route);
 
         // Get active mermaid diagrams - only for margin mode (pinned mode uses dedicated pane)
@@ -1016,6 +1055,7 @@ impl crate::tui::TuiState for App {
             workspace_animation_tick,
             ambient_info: gather_ambient_info(crate::config::config().ambient.enabled),
             observed_context_tokens: self.current_stream_context_tokens(),
+            cache_hit_info,
             is_compacting: if !self.is_remote && self.provider.uses_jcode_compaction() {
                 let compaction = self.registry.compaction();
                 compaction
@@ -1212,7 +1252,7 @@ impl crate::tui::TuiState for App {
         if last_provider != provider || last_model != model {
             return None;
         }
-        let ttl_secs = crate::tui::cache_ttl_for_provider(provider)?;
+        let ttl_secs = crate::tui::cache_ttl_for_provider_model(provider, Some(&model))?;
         let elapsed = last_completed.elapsed().as_secs();
         let remaining = ttl_secs.saturating_sub(elapsed);
         Some(crate::tui::CacheTtlInfo {

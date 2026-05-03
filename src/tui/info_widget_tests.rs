@@ -1,8 +1,9 @@
 use super::{
-    BackgroundInfo, GraphEdge, GraphNode, InfoWidgetData, Margins, MemoryActivity, MemoryEvent,
-    MemoryEventKind, MemoryInfo, MemoryState, PipelineState, StepStatus, SwarmInfo, UsageInfo,
-    UsageProvider, WidgetKind, calculate_placements, occasional_status_tip, render_memory_compact,
-    render_memory_widget, render_model_widget, truncate_smart,
+    BackgroundInfo, CacheHitInfo, CacheMissAttribution, GraphEdge, GraphNode, InfoWidgetData,
+    Margins, MemoryActivity, MemoryEvent, MemoryEventKind, MemoryInfo, MemoryState, PipelineState,
+    StepStatus, SwarmInfo, UsageInfo, UsageProvider, WidgetKind, calculate_placements,
+    occasional_status_tip, render_kv_cache_widget, render_memory_compact, render_memory_widget,
+    render_model_widget, truncate_smart,
 };
 use crate::protocol::SwarmMemberStatus;
 use ratatui::layout::Rect;
@@ -23,6 +24,46 @@ fn occasional_status_tip_only_shows_during_part_of_cycle() {
     assert!(occasional_status_tip(60, 39).is_some());
     assert!(occasional_status_tip(60, 40).is_none());
     assert!(occasional_status_tip(60, 89).is_none());
+}
+
+#[test]
+fn kv_cache_widget_shows_session_hit_ratio() {
+    let data = InfoWidgetData {
+        cache_hit_info: Some(CacheHitInfo {
+            reported_input_tokens: 20_000,
+            read_tokens: 15_000,
+            creation_tokens: 3_000,
+            optimal_input_tokens: 16_667,
+            last_reported_input_tokens: Some(10_000),
+            last_read_tokens: Some(9_400),
+            last_optimal_input_tokens: Some(9_895),
+            miss_attributions: vec![CacheMissAttribution {
+                turn_number: 20,
+                call_index: 1,
+                missed_tokens: 69_000,
+                reason: "provider switch".to_string(),
+            }],
+        }),
+        ..Default::default()
+    };
+
+    assert!(data.has_data_for(WidgetKind::KvCache));
+    let lines = render_kv_cache_widget(&data, Rect::new(0, 0, 40, 5));
+    let text = lines_text(&lines);
+
+    assert_eq!(lines.len(), 4);
+    assert!(text.contains("KV cache:"));
+    assert!(text.contains("warm "));
+    assert!(text.contains("90%"));
+    assert!(text.contains("last "));
+    assert!(text.contains("94%"));
+    assert!(text.contains("all "));
+    assert!(text.contains("75%"));
+    assert!(text.contains("miss attribution"));
+    assert!(text.contains("69k missed total"));
+    assert!(text.contains("20>"));
+    assert!(text.contains("69k miss"));
+    assert!(text.contains("provider switch"));
 }
 
 fn node(kind: &str, label: &str, degree: usize) -> GraphNode {

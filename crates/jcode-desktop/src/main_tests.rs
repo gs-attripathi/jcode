@@ -161,12 +161,23 @@ fn single_session_typography_targets_jetbrains_mono_light_nerd() {
     assert_eq!(SINGLE_SESSION_FONT_FAMILY, "JetBrainsMono Nerd Font");
     assert_eq!(SINGLE_SESSION_FONT_WEIGHT, "Light");
     assert!(SINGLE_SESSION_FONT_FALLBACKS.contains(&"monospace"));
-    assert!(SINGLE_SESSION_TITLE_FONT_SIZE >= 28.0);
-    assert!(SINGLE_SESSION_BODY_FONT_SIZE >= 22.0);
-    assert!(SINGLE_SESSION_CODE_FONT_SIZE >= 21.0);
-    assert!(SINGLE_SESSION_TITLE_FONT_SIZE > SINGLE_SESSION_BODY_FONT_SIZE);
-    assert!(SINGLE_SESSION_BODY_FONT_SIZE > SINGLE_SESSION_META_FONT_SIZE);
-    assert!(SINGLE_SESSION_CODE_FONT_SIZE <= SINGLE_SESSION_BODY_FONT_SIZE);
+    assert_eq!(SINGLE_SESSION_DEFAULT_FONT_SIZE, 22.0);
+    assert_eq!(
+        SINGLE_SESSION_TITLE_FONT_SIZE,
+        SINGLE_SESSION_DEFAULT_FONT_SIZE
+    );
+    assert_eq!(
+        SINGLE_SESSION_BODY_FONT_SIZE,
+        SINGLE_SESSION_DEFAULT_FONT_SIZE
+    );
+    assert_eq!(
+        SINGLE_SESSION_META_FONT_SIZE,
+        SINGLE_SESSION_DEFAULT_FONT_SIZE
+    );
+    assert_eq!(
+        SINGLE_SESSION_CODE_FONT_SIZE,
+        SINGLE_SESSION_DEFAULT_FONT_SIZE
+    );
     assert!(SINGLE_SESSION_BODY_LINE_HEIGHT > SINGLE_SESSION_CODE_LINE_HEIGHT);
     assert!(SINGLE_SESSION_CODE_LINE_HEIGHT > SINGLE_SESSION_META_LINE_HEIGHT);
 }
@@ -218,6 +229,24 @@ fn single_session_active_work_uses_native_spinner_geometry() {
         positions_for_color(&tick_zero, NATIVE_SPINNER_HEAD_COLOR),
         positions_for_color(&tick_one, NATIVE_SPINNER_HEAD_COLOR)
     );
+}
+
+#[test]
+fn single_session_streaming_response_uses_line_reveal_shimmer() {
+    let mut app = SingleSessionApp::new(None);
+    let size = PhysicalSize::new(900, 700);
+    assert!(single_session_streaming_shimmer(&app, size, 0).is_none());
+
+    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
+        "streaming answer".to_string(),
+    ));
+    let tick_zero = single_session_streaming_shimmer(&app, size, 0).expect("streaming shimmer");
+    let tick_one = single_session_streaming_shimmer(&app, size, 8).expect("streaming shimmer");
+
+    assert!(tick_zero.soft_rect.width > tick_zero.core_rect.width);
+    assert_eq!(tick_zero.soft_rect.y, tick_zero.core_rect.y);
+    assert_eq!(tick_zero.soft_rect.height, tick_zero.core_rect.height);
+    assert!(tick_one.core_rect.x > tick_zero.core_rect.x);
 }
 
 #[test]
@@ -593,6 +622,14 @@ fn single_session_body_styled_lines_follow_roles_and_overlays() {
         .push(SingleSessionMessage::meta("model switched"));
 
     let lines = app.body_styled_lines();
+    let segments = single_session_styled_text_segments(&lines);
+    assert!(segments.contains(&("1".to_string(), user_prompt_number_color(1))));
+    assert!(segments.contains(&("› ".to_string(), text_color(USER_PROMPT_ACCENT_COLOR))));
+    assert!(segments.contains(&(
+        "question".to_string(),
+        single_session_line_color(SingleSessionLineStyle::User)
+    )));
+
     assert_eq!(
         style_for_text(&lines, "1  question"),
         Some(SingleSessionLineStyle::User)
@@ -652,10 +689,6 @@ fn glyphon_body_buffer_uses_line_style_colors() {
     let buffers = single_session_text_buffers(&app, PhysicalSize::new(1200, 760), &mut font_system);
     let body = &buffers[1];
 
-    assert_eq!(
-        first_glyph_color_for_text(body, "1  question"),
-        Some(single_session_line_color(SingleSessionLineStyle::User))
-    );
     assert_eq!(
         first_glyph_color_for_text(body, "answer"),
         Some(single_session_line_color(SingleSessionLineStyle::Assistant))
@@ -799,18 +832,41 @@ fn single_session_hotkey_help_toggles_discoverable_shortcuts() {
 
     assert_eq!(app.handle_key(KeyInput::HotkeyHelp), KeyOutcome::Redraw);
     assert!(app.show_help);
-    let help = app.body_lines().join("\n");
-    assert!(help.contains("desktop shortcuts"));
-    assert!(help.contains("Ctrl+Enter  queue while running, send when idle"));
-    assert!(help.contains("Ctrl+Shift+C copy latest assistant response"));
-    assert!(help.contains("Ctrl+P/O    open recent session switcher"));
-    assert!(help.contains("Alt+Up/Down jump between user prompts"));
-    assert!(!help.contains("desktop queue follow-up pending"));
-    assert!(!help.contains("1  question"));
+    let help = app.body_lines();
+    assert!(help.iter().any(|line| line == "desktop shortcuts"));
+    assert!(help_has_shortcut(
+        &help,
+        "Ctrl+Enter",
+        "queue while running, send when idle"
+    ));
+    assert!(help_has_shortcut(
+        &help,
+        "Ctrl+Shift+C",
+        "copy latest assistant response"
+    ));
+    assert!(help_has_shortcut(
+        &help,
+        "Ctrl+P/O",
+        "open recent session switcher"
+    ));
+    assert!(help_has_shortcut(
+        &help,
+        "Alt+Up/Down",
+        "jump between user prompts"
+    ));
+    let help_text = help.join("\n");
+    assert!(!help_text.contains("desktop queue follow-up pending"));
+    assert!(!help_text.contains("1  question"));
 
     assert_eq!(app.handle_key(KeyInput::Escape), KeyOutcome::Redraw);
     assert!(!app.show_help);
     assert!(app.body_lines().join("\n").contains("1  question"));
+}
+
+fn help_has_shortcut(lines: &[String], shortcut: &str, description: &str) -> bool {
+    lines
+        .iter()
+        .any(|line| line.contains(shortcut) && line.contains(description))
 }
 
 #[test]
@@ -1367,6 +1423,18 @@ fn headless_chat_smoke_message_parses_hidden_flag() {
         headless_chat_smoke_message(&["jcode-desktop".to_string()]),
         None
     );
+}
+
+#[test]
+fn desktop_help_text_documents_desktop_options() {
+    let help = desktop_help_text();
+
+    assert!(help.contains("Usage:"));
+    assert!(help.contains("--fullscreen"));
+    assert!(help.contains("--workspace"));
+    assert!(help.contains("--headless-chat-smoke <MSG>"));
+    assert!(help.contains("--version"));
+    assert!(help.contains("--help"));
 }
 
 #[test]

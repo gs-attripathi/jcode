@@ -1,10 +1,12 @@
 use super::{
-    CommunicateInput, CommunicateTool, default_await_target_statuses, format_awaited_members,
-    format_members, format_plan_status,
+    CommunicateInput, CommunicateTool, cleanup_candidate_session_ids,
+    default_await_target_statuses, default_cleanup_target_statuses, format_awaited_members,
+    format_awaited_members_with_reports, format_members, format_plan_status,
+    latest_assistant_report, resolve_optional_target_session,
 };
 use crate::message::{Message, StreamEvent, ToolDefinition};
 use crate::protocol::{
-    AgentInfo, AgentStatusSnapshot, AwaitedMemberStatus, Request, ServerEvent,
+    AgentInfo, AgentStatusSnapshot, AwaitedMemberStatus, HistoryMessage, Request, ServerEvent,
     SessionActivitySnapshot, ToolCallSummary,
 };
 use crate::provider::{EventStream, Provider};
@@ -15,6 +17,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +48,79 @@ fn format_plan_status_includes_next_ready() {
     assert!(text.contains("Next up: task-2"));
     assert!(text.contains("Newly ready: task-3"));
     assert!(text.contains("Blocked: task-4"));
+}
+
+#[test]
+fn latest_assistant_report_uses_last_non_empty_assistant_message() {
+    let messages = vec![
+        HistoryMessage {
+            role: "assistant".to_string(),
+            content: " earlier ".to_string(),
+            tool_calls: None,
+            tool_data: None,
+        },
+        HistoryMessage {
+            role: "user".to_string(),
+            content: "ignored".to_string(),
+            tool_calls: None,
+            tool_data: None,
+        },
+        HistoryMessage {
+            role: "assistant".to_string(),
+            content: " final report ".to_string(),
+            tool_calls: None,
+            tool_data: None,
+        },
+    ];
+
+    assert_eq!(
+        latest_assistant_report(&messages).as_deref(),
+        Some("final report")
+    );
+}
+
+#[test]
+fn format_awaited_members_includes_completion_reports() {
+    let members = vec![AwaitedMemberStatus {
+        session_id: "session_worker".to_string(),
+        friendly_name: Some("worker".to_string()),
+        status: "ready".to_string(),
+        done: true,
+        completion_report: Some("Structured report wins.".to_string()),
+    }];
+    let reports = HashMap::from([(
+        "session_worker".to_string(),
+        "Outcome: finished. Validation: tests passed.".to_string(),
+    )]);
+
+    let output = format_awaited_members_with_reports(
+        true,
+        "All 1 members are done: worker",
+        &members,
+        &reports,
+    )
+    .output;
+
+    assert!(output.contains("Completion reports:"));
+    assert!(output.contains("--- worker (ready) ---"));
+    assert!(output.contains("Structured report wins."));
+    assert!(!output.contains("Outcome: finished"));
+}
+
+#[test]
+fn resolve_optional_target_session_defaults_to_current() {
+    assert_eq!(
+        resolve_optional_target_session(None, "session_current"),
+        "session_current"
+    );
+    assert_eq!(
+        resolve_optional_target_session(Some("current".to_string()), "session_current"),
+        "session_current"
+    );
+    assert_eq!(
+        resolve_optional_target_session(Some("session_other".to_string()), "session_current"),
+        "session_other"
+    );
 }
 
 #[test]
@@ -90,7 +166,12 @@ fn schema_advertises_supported_swarm_fields() {
     assert!(props.contains_key("wake"));
     assert!(props.contains_key("delivery"));
     assert!(props.contains_key("plan_items"));
-    assert!(!props.contains_key("initial_message"));
+    assert!(props.contains_key("initial_message"));
+    assert!(props.contains_key("force"));
+    assert!(props.contains_key("retain_agents"));
+    assert!(props.contains_key("status"));
+    assert!(props.contains_key("validation"));
+    assert!(props.contains_key("follow_up"));
     assert_eq!(
         props["delivery"]["enum"],
         json!(["notify", "interrupt", "wake"])
@@ -109,6 +190,12 @@ fn schema_advertises_supported_swarm_fields() {
         schema["properties"]["action"]["enum"]
             .as_array()
             .expect("action enum")
+            .contains(&json!("report"))
+    );
+    assert!(
+        schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
             .contains(&json!("plan_status"))
     );
     assert!(
@@ -121,6 +208,12 @@ fn schema_advertises_supported_swarm_fields() {
         schema["properties"]["action"]["enum"]
             .as_array()
             .expect("action enum")
+            .contains(&json!("start_task"))
+    );
+    assert!(
+        schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
             .contains(&json!("assign_next"))
     );
     assert!(
@@ -128,6 +221,18 @@ fn schema_advertises_supported_swarm_fields() {
             .as_array()
             .expect("action enum")
             .contains(&json!("fill_slots"))
+    );
+    assert!(
+        schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .contains(&json!("run_plan"))
+    );
+    assert!(
+        schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .contains(&json!("cleanup"))
     );
     assert!(
         schema["properties"]["action"]["enum"]

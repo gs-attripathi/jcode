@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-static AMBIENT_INFO_CACHE: Mutex<Option<(std::time::Instant, bool, Option<AmbientWidgetData>)>> =
-    Mutex::new(None);
+static AMBIENT_INFO_CACHE: Mutex<
+    Option<(std::time::Instant, bool, Option<AmbientWidgetData>, bool)>,
+> = Mutex::new(None);
 
 #[derive(Clone)]
 pub(super) struct CachedContextInfo {
@@ -444,98 +445,9 @@ fn spawn_command_in_new_terminal(
     title: &str,
     cwd: &Path,
 ) -> anyhow::Result<bool> {
-    use std::process::{Command, Stdio};
-
-    let mut last_spawn_error: Option<std::io::Error> = None;
-
-    #[cfg(unix)]
-    let resume_terminal_candidates = resume_terminal_candidates_unix();
-    #[cfg(not(unix))]
-    let resume_terminal_candidates = resume_terminal_candidates_windows();
-
-    for term in resume_terminal_candidates {
-        let mut cmd = Command::new(term.as_str());
-        cmd.current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        match term.as_str() {
-            #[cfg(unix)]
-            "handterm" => {
-                let command = shell_command(
-                    &std::iter::once(program.to_string_lossy().into_owned())
-                        .chain(args.iter().cloned())
-                        .collect::<Vec<_>>(),
-                );
-                cmd.args(["--standalone", "--backend", "gpu", "--exec", &command]);
-            }
-            "kitty" => {
-                cmd.args(["--title", title, "-e"]).arg(program).args(args);
-            }
-            "wezterm" => {
-                cmd.args([
-                    "start",
-                    "--always-new-process",
-                    "--",
-                    program.to_string_lossy().as_ref(),
-                ]);
-                cmd.args(args);
-            }
-            "alacritty" | "konsole" | "xterm" | "foot" => {
-                if term == "alacritty" {
-                    cmd.args(["--title", title, "-e"]).arg(program).args(args);
-                } else {
-                    cmd.args(["-e"]).arg(program).args(args);
-                }
-            }
-            "gnome-terminal" => {
-                cmd.arg("--title").arg(title);
-                cmd.arg("--").arg(program).args(args);
-            }
-            #[cfg(target_os = "macos")]
-            "iterm2" => {
-                cmd = Command::new("osascript");
-                cmd.args([
-                    "-e",
-                    &format!(
-                        r#"tell application \"iTerm2\"
-                            create window with default profile command \"{}\"
-                        end tell"#,
-                        shell_command(
-                            &std::iter::once(program.to_string_lossy().into_owned())
-                                .chain(args.iter().cloned())
-                                .collect::<Vec<_>>()
-                        )
-                    ),
-                ]);
-            }
-            #[cfg(target_os = "macos")]
-            "terminal" => {
-                cmd = Command::new("open");
-                cmd.args([
-                    "-a",
-                    "Terminal",
-                    program.to_str().unwrap_or("jcode"),
-                    "--args",
-                ]);
-                cmd.args(args);
-            }
-            _ => continue,
-        }
-
-        match crate::platform::spawn_detached(&mut cmd) {
-            Ok(_) => return Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => last_spawn_error = Some(err),
-        }
-    }
-
-    if let Some(err) = last_spawn_error {
-        Err(err.into())
-    } else {
-        Ok(false)
-    }
+    let command = crate::terminal_launch::TerminalCommand::new(program, args.to_vec())
+        .title(title.to_string());
+    crate::terminal_launch::spawn_command_in_new_terminal(&command, cwd)
 }
 
 pub(super) fn spawn_resume_target_in_new_terminal(
@@ -559,145 +471,6 @@ fn resumed_window_title(session_id: &str) -> String {
     } else {
         format!("{} jcode {}", icon, session_name)
     }
-}
-
-#[cfg(unix)]
-fn sh_escape(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\"'\"'"))
-}
-
-fn shell_command(args: &[String]) -> String {
-    #[cfg(unix)]
-    {
-        args.iter()
-            .map(|arg| sh_escape(arg))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    #[cfg(not(unix))]
-    {
-        args.join(" ")
-    }
-}
-
-fn push_unique_terminal(candidates: &mut Vec<String>, term: impl Into<String>) {
-    let term = term.into();
-    if term.trim().is_empty() {
-        return;
-    }
-    if !candidates.iter().any(|candidate| candidate == &term) {
-        candidates.push(term);
-    }
-}
-
-fn detected_resume_terminal() -> Option<&'static str> {
-    #[cfg(unix)]
-    {
-        if std::env::var("HANDTERM_SESSION").is_ok() || std::env::var("HANDTERM_PID").is_ok() {
-            return Some("handterm");
-        }
-        if std::env::var("TERM_PROGRAM")
-            .ok()
-            .map(|value| value.eq_ignore_ascii_case("handterm"))
-            .unwrap_or(false)
-        {
-            return Some("handterm");
-        }
-        if std::env::var("KITTY_PID").is_ok() {
-            return Some("kitty");
-        }
-        if std::env::var("WEZTERM_EXECUTABLE").is_ok() || std::env::var("WEZTERM_PANE").is_ok() {
-            return Some("wezterm");
-        }
-        if std::env::var("ALACRITTY_WINDOW_ID").is_ok() {
-            return Some("alacritty");
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let term_program = std::env::var("TERM_PROGRAM")
-                .ok()
-                .map(|value| value.to_ascii_lowercase());
-            return match term_program.as_deref() {
-                Some("kitty") => Some("kitty"),
-                Some("wezterm") => Some("wezterm"),
-                Some("alacritty") => Some("alacritty"),
-                Some("iterm.app") | Some("iterm2") => Some("iterm2"),
-                Some("apple_terminal") | Some("terminal") => Some("terminal"),
-                _ => None,
-            };
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        if std::env::var("WT_SESSION").is_ok() {
-            return Some("wt");
-        }
-        if std::env::var("WEZTERM_EXECUTABLE").is_ok() || std::env::var("WEZTERM_PANE").is_ok() {
-            return Some("wezterm");
-        }
-        if std::env::var("ALACRITTY_WINDOW_ID").is_ok() {
-            return Some("alacritty");
-        }
-        None
-    }
-}
-
-fn resume_terminal_candidates_unix() -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Ok(term) = std::env::var("JCODE_TERMINAL") {
-        push_unique_terminal(&mut candidates, term);
-    }
-    if let Some(term) = detected_resume_terminal() {
-        push_unique_terminal(&mut candidates, term);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        for term in ["kitty", "wezterm", "alacritty", "iterm2", "terminal"] {
-            push_unique_terminal(&mut candidates, term);
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        for term in [
-            "handterm",
-            "kitty",
-            "wezterm",
-            "alacritty",
-            "gnome-terminal",
-            "konsole",
-            "xterm",
-            "foot",
-        ] {
-            push_unique_terminal(&mut candidates, term);
-        }
-    }
-
-    candidates
-}
-
-#[cfg(not(unix))]
-fn resume_terminal_candidates_windows() -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Ok(term) = std::env::var("JCODE_TERMINAL") {
-        push_unique_terminal(&mut candidates, term);
-    }
-    if let Some(term) = detected_resume_terminal() {
-        push_unique_terminal(&mut candidates, term);
-    }
-    for term in ["wezterm", "wt", "alacritty"] {
-        push_unique_terminal(&mut candidates, term);
-    }
-    candidates
 }
 
 #[cfg(unix)]
@@ -932,24 +705,38 @@ pub(super) fn gather_git_info() -> Option<GitInfo> {
     use std::sync::Mutex;
     use std::time::Instant;
 
-    static CACHE: Mutex<Option<(Instant, Option<GitInfo>)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<(Instant, Option<GitInfo>, bool)>> = Mutex::new(None);
 
     const TTL: Duration = Duration::from_secs(5);
 
-    if let Ok(guard) = CACHE.lock()
-        && let Some((ts, ref cached)) = *guard
-        && ts.elapsed() < TTL
-    {
-        return cached.clone();
-    }
-
-    let result = gather_git_info_inner();
-
     if let Ok(mut guard) = CACHE.lock() {
-        *guard = Some((Instant::now(), result.clone()));
-    }
+        if let Some((ts, cached, refreshing)) = guard.as_mut() {
+            if ts.elapsed() < TTL {
+                return cached.clone();
+            }
+            if *refreshing {
+                return cached.clone();
+            }
+            let stale = cached.clone();
+            *refreshing = true;
+            std::thread::spawn(|| {
+                let result = gather_git_info_inner();
+                if let Ok(mut guard) = CACHE.lock() {
+                    *guard = Some((Instant::now(), result, false));
+                }
+            });
+            return stale;
+        }
 
-    result
+        *guard = Some((Instant::now() - TTL - Duration::from_secs(1), None, true));
+        std::thread::spawn(|| {
+            let result = gather_git_info_inner();
+            if let Ok(mut guard) = CACHE.lock() {
+                *guard = Some((Instant::now(), result, false));
+            }
+        });
+    }
+    None
 }
 
 pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem> {
@@ -957,7 +744,7 @@ pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem
     use std::sync::{LazyLock, Mutex};
     use std::time::Instant;
 
-    type TodosCache = HashMap<String, (Instant, Vec<TodoItem>)>;
+    type TodosCache = HashMap<String, (Instant, Vec<TodoItem>, bool)>;
 
     static CACHE: LazyLock<Mutex<TodosCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
     const TTL: Duration = Duration::from_secs(1);
@@ -966,27 +753,50 @@ pub(super) fn gather_todos_for_session(session_id: Option<&str>) -> Vec<TodoItem
         return Vec::new();
     };
 
-    if let Ok(cache) = CACHE.lock()
-        && let Some((ts, todos)) = cache.get(session_id)
-        && ts.elapsed() < TTL
-    {
-        return todos.clone();
-    }
-
-    let todos = crate::todo::load_todos(session_id).unwrap_or_default();
-
     if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(session_id.to_string(), (Instant::now(), todos.clone()));
-    }
+        if let Some((ts, todos, refreshing)) = cache.get_mut(session_id) {
+            if ts.elapsed() < TTL {
+                return todos.clone();
+            }
+            if *refreshing {
+                return todos.clone();
+            }
+            let stale = todos.clone();
+            *refreshing = true;
+            let session_id = session_id.to_string();
+            std::thread::spawn(move || {
+                let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
+                if let Ok(mut cache) = CACHE.lock() {
+                    cache.insert(session_id, (Instant::now(), todos, false));
+                }
+            });
+            return stale;
+        }
 
-    todos
+        let session_id = session_id.to_string();
+        cache.insert(
+            session_id.clone(),
+            (
+                Instant::now() - TTL - Duration::from_secs(1),
+                Vec::new(),
+                true,
+            ),
+        );
+        std::thread::spawn(move || {
+            let todos = crate::todo::load_todos(&session_id).unwrap_or_default();
+            if let Ok(mut cache) = CACHE.lock() {
+                cache.insert(session_id, (Instant::now(), todos, false));
+            }
+        });
+    }
+    Vec::new()
 }
 
 pub(super) fn gather_memory_info(memory_enabled: bool) -> Option<MemoryInfo> {
     use std::sync::Mutex;
     use std::time::Instant;
 
-    static CACHE: Mutex<Option<(Instant, Option<MemoryInfo>)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<(Instant, Option<MemoryInfo>, bool)>> = Mutex::new(None);
     const TTL: Duration = Duration::from_secs(2);
 
     if !memory_enabled {
@@ -1005,24 +815,75 @@ pub(super) fn gather_memory_info(memory_enabled: bool) -> Option<MemoryInfo> {
         None
     };
 
-    if let Ok(guard) = CACHE.lock()
-        && let Some((ts, ref cached)) = *guard
-        && ts.elapsed() < TTL
-    {
-        return match cached.clone() {
-            Some(mut info) => {
-                info.activity = activity.clone();
-                info.sidecar_model = sidecar_model.clone();
-                Some(info)
+    if let Ok(mut guard) = CACHE.lock() {
+        if let Some((ts, cached, refreshing)) = guard.as_mut() {
+            if ts.elapsed() < TTL || *refreshing {
+                return match cached.clone() {
+                    Some(mut info) => {
+                        info.activity = activity.clone();
+                        info.sidecar_model = sidecar_model.clone();
+                        Some(info)
+                    }
+                    None => activity.clone().map(|activity| MemoryInfo {
+                        sidecar_available: crate::memory::memory_sidecar_enabled(),
+                        sidecar_model: sidecar_model.clone(),
+                        activity: Some(activity),
+                        ..Default::default()
+                    }),
+                };
             }
-            None => activity.clone().map(|activity| MemoryInfo {
-                sidecar_available: crate::memory::memory_sidecar_enabled(),
-                sidecar_model: sidecar_model.clone(),
-                activity: Some(activity),
-                ..Default::default()
-            }),
-        };
+            let stale = match cached.clone() {
+                Some(mut info) => {
+                    info.activity = activity.clone();
+                    info.sidecar_model = sidecar_model.clone();
+                    Some(info)
+                }
+                None => activity.clone().map(|activity| MemoryInfo {
+                    sidecar_available: crate::memory::memory_sidecar_enabled(),
+                    sidecar_model: sidecar_model.clone(),
+                    activity: Some(activity),
+                    ..Default::default()
+                }),
+            };
+            *refreshing = true;
+            std::thread::spawn(|| {
+                let result = gather_memory_info_inner();
+                if let Ok(mut guard) = CACHE.lock() {
+                    *guard = Some((Instant::now(), result, false));
+                }
+            });
+            return stale;
+        }
+
+        *guard = Some((Instant::now() - TTL - Duration::from_secs(1), None, true));
+        std::thread::spawn(|| {
+            let result = gather_memory_info_inner();
+            if let Ok(mut guard) = CACHE.lock() {
+                *guard = Some((Instant::now(), result, false));
+            }
+        });
     }
+
+    activity.map(|activity| MemoryInfo {
+        sidecar_available: crate::memory::memory_sidecar_enabled(),
+        sidecar_model,
+        activity: Some(activity),
+        ..Default::default()
+    })
+}
+
+fn gather_memory_info_inner() -> Option<MemoryInfo> {
+    let activity = crate::memory::get_activity();
+    let sidecar_model = if crate::memory::memory_sidecar_enabled() {
+        let sidecar = crate::sidecar::Sidecar::new();
+        Some(format!(
+            "{} · {}",
+            sidecar.backend_name(),
+            sidecar.model_name()
+        ))
+    } else {
+        None
+    };
 
     use crate::memory::MemoryManager;
 
@@ -1059,7 +920,7 @@ pub(super) fn gather_memory_info(memory_enabled: bool) -> Option<MemoryInfo> {
         global_graph.as_ref(),
     );
 
-    let result = if total_count > 0 || activity.is_some() || sidecar_model.is_some() {
+    if total_count > 0 || activity.is_some() || sidecar_model.is_some() {
         Some(MemoryInfo {
             total_count,
             project_count,
@@ -1073,27 +934,55 @@ pub(super) fn gather_memory_info(memory_enabled: bool) -> Option<MemoryInfo> {
         })
     } else {
         None
-    };
-
-    if let Ok(mut guard) = CACHE.lock() {
-        *guard = Some((Instant::now(), result.clone()));
     }
-
-    result
 }
 
 pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidgetData> {
     use std::time::Instant;
     const TTL: Duration = Duration::from_secs(2);
 
-    if let Ok(guard) = AMBIENT_INFO_CACHE.lock()
-        && let Some((ts, cached_enabled, ref cached)) = *guard
-        && cached_enabled == ambient_enabled
-        && ts.elapsed() < TTL
-    {
-        return cached.clone();
+    if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock() {
+        if let Some((ts, cached_enabled, cached, refreshing)) = guard.as_mut() {
+            if *cached_enabled == ambient_enabled && ts.elapsed() < TTL {
+                return cached.clone();
+            }
+            if *cached_enabled == ambient_enabled && *refreshing {
+                return cached.clone();
+            }
+            let stale = if *cached_enabled == ambient_enabled {
+                cached.clone()
+            } else {
+                None
+            };
+            *refreshing = true;
+            *cached_enabled = ambient_enabled;
+            std::thread::spawn(move || {
+                let result = gather_ambient_info_inner(ambient_enabled);
+                if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock() {
+                    *guard = Some((Instant::now(), ambient_enabled, result, false));
+                }
+            });
+            return stale;
+        }
+
+        *guard = Some((
+            Instant::now() - TTL - Duration::from_secs(1),
+            ambient_enabled,
+            None,
+            true,
+        ));
+        std::thread::spawn(move || {
+            let result = gather_ambient_info_inner(ambient_enabled);
+            if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock() {
+                *guard = Some((Instant::now(), ambient_enabled, result, false));
+            }
+        });
     }
 
+    None
+}
+
+fn gather_ambient_info_inner(ambient_enabled: bool) -> Option<AmbientWidgetData> {
     let state = crate::ambient::AmbientState::load().unwrap_or_default();
     let manager = crate::ambient::AmbientManager::new().ok();
     let queue_items: Vec<_> = manager
@@ -1113,9 +1002,6 @@ pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidget
         .copied();
 
     if !ambient_enabled && reminder_count == 0 {
-        if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock() {
-            *guard = Some((Instant::now(), ambient_enabled, None));
-        }
         return None;
     }
 
@@ -1147,7 +1033,7 @@ pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidget
             .to_string()
     });
 
-    let result = Some(AmbientWidgetData {
+    Some(AmbientWidgetData {
         show_widget: ambient_enabled || reminder_count > 1,
         status: state.status,
         queue_count,
@@ -1160,13 +1046,7 @@ pub(super) fn gather_ambient_info(ambient_enabled: bool) -> Option<AmbientWidget
         next_reminder_wake: next_reminder_item
             .map(|item| format_countdown_until(item.scheduled_for)),
         budget_percent: None,
-    });
-
-    if let Ok(mut guard) = AMBIENT_INFO_CACHE.lock() {
-        *guard = Some((Instant::now(), ambient_enabled, result.clone()));
-    }
-
-    result
+    })
 }
 
 #[cfg(test)]

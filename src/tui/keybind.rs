@@ -494,6 +494,34 @@ impl EffortSwitchKeys {
         }
         None
     }
+
+    pub fn macos_option_arrow_escape_direction_for(
+        &self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<i8> {
+        if !self.uses_default_alt_arrow_bindings() {
+            return None;
+        }
+
+        let (code, modifiers) = normalize_key(code, modifiers);
+        if modifiers != KeyModifiers::ALT {
+            return None;
+        }
+
+        // Terminal.app and common iTerm2 profiles encode Option+Left/Right as
+        // ESC+b / ESC+f. Crossterm exposes those as Alt+B / Alt+F, not Alt+Arrow.
+        match code {
+            KeyCode::Char('f') => Some(1),
+            KeyCode::Char('b') => Some(-1),
+            _ => None,
+        }
+    }
+
+    fn uses_default_alt_arrow_bindings(&self) -> bool {
+        self.increase.matches(KeyCode::Right, KeyModifiers::ALT)
+            && self.decrease.matches(KeyCode::Left, KeyModifiers::ALT)
+    }
 }
 
 pub fn load_effort_switch_keys() -> EffortSwitchKeys {
@@ -748,9 +776,78 @@ mod tests {
         assert_eq!(cmd.code, KeyCode::Char('j'));
         assert!(cmd.modifiers.contains(KeyModifiers::SUPER));
 
+        let option_left = parse_keybinding("option+left").expect("option+left should parse");
+        assert_eq!(option_left.code, KeyCode::Left);
+        assert!(option_left.modifiers.contains(KeyModifiers::ALT));
+
         let meta = parse_keybinding("meta+k").expect("meta+k should parse");
         assert_eq!(meta.code, KeyCode::Char('k'));
         assert!(meta.modifiers.contains(KeyModifiers::ALT));
+    }
+
+    #[test]
+    fn effort_switch_keys_match_macos_option_arrows_as_alt_arrows() {
+        let keys = EffortSwitchKeys {
+            increase: parse_keybinding("alt+right").expect("alt+right should parse"),
+            decrease: parse_keybinding("alt+left").expect("alt+left should parse"),
+        };
+
+        // macOS labels the Alt modifier as Option (⌥). Terminals that forward
+        // Option-arrow as an Alt-modified arrow should adjust reasoning effort.
+        assert_eq!(
+            keys.direction_for(KeyCode::Right, KeyModifiers::ALT),
+            Some(1)
+        );
+        assert_eq!(
+            keys.direction_for(KeyCode::Left, KeyModifiers::ALT),
+            Some(-1)
+        );
+        assert_eq!(
+            parse_keybinding("option+right")
+                .expect("option+right should parse")
+                .modifiers,
+            KeyModifiers::ALT
+        );
+    }
+
+    #[test]
+    fn effort_switch_keys_match_macos_terminal_option_arrow_escape_encoding() {
+        let keys = EffortSwitchKeys {
+            increase: parse_keybinding("alt+right").expect("alt+right should parse"),
+            decrease: parse_keybinding("alt+left").expect("alt+left should parse"),
+        };
+
+        // Terminal.app and many iTerm2 profiles encode Option+Right as ESC+f
+        // and Option+Left as ESC+b. Crossterm reports those as Alt+F/B.
+        assert_eq!(
+            keys.macos_option_arrow_escape_direction_for(KeyCode::Char('f'), KeyModifiers::ALT),
+            Some(1)
+        );
+        assert_eq!(
+            keys.macos_option_arrow_escape_direction_for(KeyCode::Char('b'), KeyModifiers::ALT),
+            Some(-1)
+        );
+        assert_eq!(
+            keys.macos_option_arrow_escape_direction_for(KeyCode::Char('f'), KeyModifiers::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn effort_switch_keys_do_not_apply_macos_escape_aliases_after_remap() {
+        let keys = EffortSwitchKeys {
+            increase: parse_keybinding("ctrl+right").expect("ctrl+right should parse"),
+            decrease: parse_keybinding("ctrl+left").expect("ctrl+left should parse"),
+        };
+
+        assert_eq!(
+            keys.macos_option_arrow_escape_direction_for(KeyCode::Char('f'), KeyModifiers::ALT),
+            None
+        );
+        assert_eq!(
+            keys.macos_option_arrow_escape_direction_for(KeyCode::Char('b'), KeyModifiers::ALT),
+            None
+        );
     }
 
     #[test]

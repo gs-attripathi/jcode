@@ -420,6 +420,50 @@ impl App {
         true
     }
 
+    pub(in crate::tui::app) fn clear_active_experimental_feature_notice(&mut self) {
+        self.active_experimental_feature_notice = None;
+    }
+
+    pub(in crate::tui::app) fn note_experimental_feature_use(
+        &mut self,
+        key: &'static str,
+    ) -> Option<&'static str> {
+        const NOTICE: &str = "experimental feature";
+        if self
+            .experimental_feature_warnings_seen
+            .insert(key.to_string())
+        {
+            self.active_experimental_feature_notice = Some(NOTICE.to_string());
+            Some(NOTICE)
+        } else {
+            None
+        }
+    }
+
+    pub(in crate::tui::app) fn experimental_feature_key_for_tool(
+        tool: &crate::message::ToolCall,
+    ) -> Option<&'static str> {
+        if tool.name != "swarm" {
+            return None;
+        }
+
+        let action = tool.input.get("action").and_then(|value| value.as_str());
+        let spawns_agents = matches!(action, Some("spawn") | Some("fill_slots"))
+            || matches!(action, Some("assign_task") | Some("assign_next"))
+                && (tool
+                    .input
+                    .get("spawn_if_needed")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                    || tool
+                        .input
+                        .get("prefer_spawn")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false));
+
+        spawns_agents.then_some("swarm_spawn")
+    }
+
     pub(super) fn set_swarm_feature_enabled(&mut self, enabled: bool) {
         self.swarm_enabled = enabled;
         if !enabled {
@@ -692,5 +736,53 @@ impl App {
             self.session.id
         )));
         self.set_status_notice("Recovered session");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::ToolCall;
+
+    #[test]
+    fn experimental_feature_key_marks_swarm_spawn_actions() {
+        let tool = ToolCall {
+            id: "tc".to_string(),
+            name: "swarm".to_string(),
+            input: serde_json::json!({"action": "spawn", "prompt": "try it"}),
+            intent: None,
+        };
+
+        assert_eq!(
+            App::experimental_feature_key_for_tool(&tool),
+            Some("swarm_spawn")
+        );
+    }
+
+    #[test]
+    fn experimental_feature_key_marks_spawn_if_needed_assignment() {
+        let tool = ToolCall {
+            id: "tc".to_string(),
+            name: "swarm".to_string(),
+            input: serde_json::json!({"action": "assign_task", "spawn_if_needed": true}),
+            intent: None,
+        };
+
+        assert_eq!(
+            App::experimental_feature_key_for_tool(&tool),
+            Some("swarm_spawn")
+        );
+    }
+
+    #[test]
+    fn experimental_feature_key_ignores_non_spawning_swarm_actions() {
+        let tool = ToolCall {
+            id: "tc".to_string(),
+            name: "swarm".to_string(),
+            input: serde_json::json!({"action": "status"}),
+            intent: None,
+        };
+
+        assert_eq!(App::experimental_feature_key_for_tool(&tool), None);
     }
 }

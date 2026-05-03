@@ -89,6 +89,62 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
 }
 
 #[test]
+fn initial_session_context_is_persisted_once_and_not_overwritten() {
+    let mut session = Session::create_with_id(
+        "session_context_test".to_string(),
+        None,
+        Some("Session context".to_string()),
+    );
+
+    assert!(session.ensure_initial_session_context_message());
+    assert_eq!(session.messages.len(), 1);
+    let first = session.messages[0].content_preview();
+    assert!(first.contains("# Session Context"));
+    assert!(first.contains("OS:"));
+    assert_eq!(
+        session.messages[0].display_role,
+        Some(StoredDisplayRole::System)
+    );
+
+    assert!(!session.ensure_initial_session_context_message());
+    assert_eq!(session.messages.len(), 1);
+
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    );
+    assert!(!session.ensure_initial_session_context_message());
+    assert_eq!(session.messages.len(), 2);
+}
+
+#[test]
+fn existing_non_empty_session_does_not_get_retroactive_session_context() {
+    let mut session = Session::create_with_id(
+        "session_context_existing_test".to_string(),
+        None,
+        Some("Existing".to_string()),
+    );
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "already started".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    assert!(!session.ensure_initial_session_context_message());
+    assert_eq!(session.messages.len(), 1);
+    assert!(
+        !session.messages[0]
+            .content_preview()
+            .contains("# Session Context")
+    );
+}
+
+#[test]
 fn load_startup_stub_preserves_metadata_but_skips_heavy_vectors() -> Result<()> {
     let _env_lock = lock_env();
     let temp_home = tempfile::Builder::new()
@@ -685,6 +741,29 @@ fn test_render_messages_honors_background_task_display_role_override() {
 }
 
 #[test]
+fn test_render_messages_hides_internal_system_reminders() {
+    let mut session = Session::create_with_id(
+        "session_hidden_system_reminder_test".to_string(),
+        None,
+        Some("hidden reminder test".to_string()),
+    );
+
+    assert!(session.ensure_initial_session_context_message());
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "visible prompt".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    let rendered = render_messages(&session);
+    assert_eq!(rendered.len(), 1);
+    assert_eq!(rendered[0].role, "user");
+    assert_eq!(rendered[0].content, "visible prompt");
+}
+
+#[test]
 fn test_render_messages_hides_compacted_leading_history() {
     let mut session = Session::create_with_id(
         "session_render_compacted_history_test".to_string(),
@@ -945,4 +1024,81 @@ fn rewind_via_active_leaf_preserves_storage_so_branch_can_resurface() {
     let _u_new = session.add_message(Role::User, vec![ContentBlock::Text { text: "u_new".into(), cache_control: None }]);
     assert_eq!(session.active_path().len(), 3);
     assert_eq!(session.messages.len(), 7);
+}
+
+#[test]
+fn leaves_excludes_system_notes_and_active_real_leaf_walks_through_them() {
+    // Build root → asst → user "branch A" → asst (leaf A)
+    //              ↘ user "branch B" → asst (leaf B)
+    // Then /checkout @leafA which appends a UserCommand + System note as
+    // children of leafA. leaves() should still return exactly leafA and
+    // leafB (not the navigation notes), and active_real_leaf() should
+    // resolve back to leafA even though active_leaf_id points at the
+    // system note.
+    let mut session = Session::create(None, None);
+    let _root = session.add_message(Role::User, vec![ContentBlock::Text { text: "root".into(), cache_control: None }]);
+    let asst = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "asst".into(), cache_control: None }]);
+
+    let _user_a = session.add_message(Role::User, vec![ContentBlock::Text { text: "branch A".into(), cache_control: None }]);
+    let leaf_a = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "A reply".into(), cache_control: None }]);
+
+    // Move back to asst and create branch B as a sibling.
+    session.set_active_leaf(asst.clone());
+    let _user_b = session.add_message(Role::User, vec![ContentBlock::Text { text: "branch B".into(), cache_control: None }]);
+    let leaf_b = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "B reply".into(), cache_control: None }]);
+
+    // Two real leaves.
+    let leaf_ids: Vec<&str> = session.leaves().iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(leaf_ids.len(), 2);
+    assert!(leaf_ids.contains(&leaf_a.as_str()));
+    assert!(leaf_ids.contains(&leaf_b.as_str()));
+
+    // Simulate /checkout @leafA by moving leaf and appending nav notes.
+    session.set_active_leaf(leaf_a.clone());
+    let _cmd = session.add_user_command("/checkout @abcd");
+    let _note = session.add_system_note("✓ Switched to branch `@abcd`.");
+
+    // leaves() must still return exactly two real tips, not the new
+    // navigation entries.
+    let leaf_ids_after: Vec<String> = session.leaves().iter().map(|m| m.id.clone()).collect();
+    assert_eq!(leaf_ids_after.len(), 2);
+    assert!(leaf_ids_after.contains(&leaf_a));
+    assert!(leaf_ids_after.contains(&leaf_b));
+
+    // active_real_leaf walks past the system/user-command notes back to
+    // the conversation message the user thinks of as "the tip".
+    let real = session.active_real_leaf().expect("active leaf");
+    assert_eq!(real.id, leaf_a);
+}
+
+#[test]
+fn ensure_active_leaf_backfilled_prevents_history_loss_on_load() {
+    // Reproduces a real bug: when a session was loaded from snapshot
+    // (load_from_path / load_for_remote_startup / session_from_remote_startup_snapshot)
+    // without setting active_leaf_id, the next append_stored_message would
+    // wire the new message's parent_id to None and advance the leaf to it,
+    // making active_path() return only the new message and visually wiping
+    // all prior history.
+    let mut session = Session::create(None, None);
+    let m1 = session.add_message(Role::User, vec![ContentBlock::Text { text: "old1".into(), cache_control: None }]);
+    let m2 = session.add_message(Role::Assistant, vec![ContentBlock::Text { text: "old2".into(), cache_control: None }]);
+
+    // Simulate the load-from-snapshot anti-pattern: messages assigned
+    // directly without active_leaf_id being set.
+    session.active_leaf_id = None;
+    let preserved_messages = session.messages.clone();
+    let _ = preserved_messages; // documentation: messages stay; only the leaf was lost
+
+    // Apply the load-finalize step we now run on every load path.
+    session.ensure_active_leaf_backfilled();
+    assert_eq!(
+        session.active_leaf_id.as_deref(),
+        Some(m2.as_str()),
+        "backfill should anchor leaf to last message"
+    );
+
+    // Now appending a new message keeps the chain intact.
+    let m3 = session.add_message(Role::User, vec![ContentBlock::Text { text: "new1".into(), cache_control: None }]);
+    let path: Vec<&str> = session.active_path().iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(path, vec![m1.as_str(), m2.as_str(), m3.as_str()]);
 }

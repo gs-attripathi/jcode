@@ -559,7 +559,10 @@ impl Registry {
         // Drop the lock before executing
         drop(tools);
 
-        self.ensure_tool_permission(resolved_name, &input, &ctx)?;
+        // Permission gate: in "ask" mode, certain destructive tools require
+        // explicit user approval before they run. Default is "autopilot"
+        // (no gating) — set JCODE_TOOL_PERMISSION_MODE=ask to opt in.
+        Self::ensure_tool_permission(resolved_name, &input, &ctx)?;
 
         let started_at = std::time::Instant::now();
         let result = tool.execute(input.clone(), ctx).await;
@@ -575,9 +578,19 @@ impl Registry {
         Ok(output)
     }
 
-    fn ensure_tool_permission(&self, name: &str, input: &Value, ctx: &ToolContext) -> Result<()> {
-        let cfg = crate::config::Config::load();
-        let mode = cfg.safety.tool_permission_mode;
+    fn ensure_tool_permission(name: &str, input: &Value, ctx: &ToolContext) -> Result<()> {
+        let mode = match std::env::var("JCODE_TOOL_PERMISSION_MODE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+        {
+            Some(m) if m == "ask" || m == "strict" || m == "confirm" => {
+                crate::safety::ToolPermissionMode::Ask
+            }
+            _ => crate::safety::ToolPermissionMode::Autopilot,
+        };
+
         let Some(requirement) = crate::safety::tool_permission_requirement(
             mode,
             name,

@@ -10,12 +10,23 @@ use std::time::Duration;
 /// Claude Code OAuth configuration
 pub mod claude {
     pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-    pub const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-    pub const TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
-    pub const REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+    /// Claude Code uses the Claude.ai OAuth surface for tokens that can call
+    /// `/v1/messages` with the `user:inference` scope. The platform/console
+    /// authorize endpoint can mint tokens that refresh successfully but are not
+    /// accepted by the inference API.
+    pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+    pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
+    pub const CLAUDE_AI_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+    pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+    pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+    pub const LEGACY_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
     pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
-    pub const SCOPES: &str = "org:create_api_key user:profile user:inference";
+    pub const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+    pub const REFRESH_SCOPES: &str =
+        "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 }
+
+const CLAUDE_TOKEN_TIMEOUT_SECS: u64 = 15;
 
 /// OpenAI Codex OAuth configuration
 pub mod openai {
@@ -43,6 +54,43 @@ pub struct OAuthTokens {
     pub expires_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+fn parse_oauth_scopes(scope: Option<&str>) -> Vec<String> {
+    scope
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|scope| !scope.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+pub(crate) fn claude_scopes_have_inference(scopes: &[String]) -> bool {
+    scopes.iter().any(|scope| {
+        matches!(
+            scope.as_str(),
+            "user:inference"
+                | "user:ccr_inference"
+                | "user:voice"
+                | "org:service_key_inference"
+                | "workspace:developer"
+                | "workspace:inference"
+        )
+    })
+}
+
+fn ensure_claude_inference_scope(scopes: &[String], action: &str) -> Result<()> {
+    if scopes.is_empty() || claude_scopes_have_inference(scopes) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "Claude OAuth {} returned a token without the required user:inference scope (scopes: {}). Re-run `jcode login --provider claude` so jcode opens the Claude.ai OAuth flow, or import/use a fresh Claude Code login.",
+        action,
+        scopes.join(" ")
+    )
 }
 
 /// Generate PKCE code verifier and challenge
@@ -559,14 +607,16 @@ pub fn claude_redirect_uri_for_input(input: &str, fallback_redirect_uri: &str) -
         return fallback_redirect_uri.to_string();
     };
 
-    let Ok(expected_manual) = url::Url::parse(claude::REDIRECT_URI) else {
-        return fallback_redirect_uri.to_string();
-    };
+    let matches_manual = [claude::REDIRECT_URI, claude::LEGACY_REDIRECT_URI]
+        .iter()
+        .filter_map(|candidate| url::Url::parse(candidate).ok())
+        .any(|expected_manual| {
+            url.scheme() == expected_manual.scheme()
+                && url.host_str() == expected_manual.host_str()
+                && url.path() == expected_manual.path()
+        });
 
-    if url.scheme() == expected_manual.scheme()
-        && url.host_str() == expected_manual.host_str()
-        && url.path() == expected_manual.path()
-    {
+    if matches_manual {
         claude::REDIRECT_URI.to_string()
     } else {
         fallback_redirect_uri.to_string()
@@ -583,6 +633,14 @@ pub fn parse_callback_input_with_state(input: &str) -> Result<(String, String)> 
             )
         })?;
     Ok((code, state))
+}
+
+fn looks_like_cloudflare_challenge(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("cf-challenge")
+        || lower.contains("cloudflare")
+        || lower.contains("just a moment")
+        || lower.contains("/cdn-cgi/challenge-platform")
 }
 
 async fn exchange_claude_code_at_url(
@@ -605,26 +663,43 @@ async fn exchange_claude_code_at_url(
         None => verifier.to_string(),
     };
 
-    let client = reqwest::Client::new();
-    let params = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("client_id", claude::CLIENT_ID.to_string()),
-        ("code", code),
-        ("code_verifier", verifier.to_string()),
-        ("redirect_uri", redirect_uri.to_string()),
-        ("state", state),
-    ];
+    #[derive(Serialize)]
+    struct ClaudeAuthorizationCodeRequest<'a> {
+        grant_type: &'static str,
+        code: &'a str,
+        redirect_uri: &'a str,
+        client_id: &'static str,
+        code_verifier: &'a str,
+        state: &'a str,
+    }
 
+    let payload = ClaudeAuthorizationCodeRequest {
+        grant_type: "authorization_code",
+        code: code.as_str(),
+        redirect_uri,
+        client_id: claude::CLIENT_ID,
+        code_verifier: verifier,
+        state: state.as_str(),
+    };
+
+    let client = reqwest::Client::new();
     let resp = client
         .post(token_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&params)
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(CLAUDE_TOKEN_TIMEOUT_SECS))
+        .json(&payload)
         .send()
         .await?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
         let text = resp.text().await?;
-        anyhow::bail!("Token exchange failed: {}", text);
+        if status == reqwest::StatusCode::FORBIDDEN && looks_like_cloudflare_challenge(&text) {
+            anyhow::bail!(
+                "Token exchange was blocked by Cloudflare before Anthropic returned OAuth tokens. jcode now matches Claude Code's JSON token exchange, but this network/IP is still being challenged. Switch VPN exit IP or network, then retry with `jcode login --provider claude --no-browser` and paste the callback URL."
+            );
+        }
+        anyhow::bail!("Token exchange failed (HTTP {}): {}", status, text);
     }
 
     #[derive(Deserialize)]
@@ -633,16 +708,20 @@ async fn exchange_claude_code_at_url(
         refresh_token: String,
         expires_in: i64,
         id_token: Option<String>,
+        scope: Option<String>,
     }
 
     let tokens: TokenResponse = resp.json().await?;
     let expires_at = chrono::Utc::now().timestamp_millis() + (tokens.expires_in * 1000);
+    let scopes = parse_oauth_scopes(tokens.scope.as_deref());
+    ensure_claude_inference_scope(&scopes, "token exchange")?;
 
     Ok(OAuthTokens {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         expires_at,
         id_token: tokens.id_token,
+        scopes,
     })
 }
 
@@ -732,6 +811,7 @@ async fn exchange_openai_code_at_url(
         refresh_token: tokens.refresh_token,
         expires_at,
         id_token: tokens.id_token,
+        scopes: Vec::new(),
     })
 }
 
@@ -834,13 +914,25 @@ pub fn save_claude_tokens(tokens: &OAuthTokens) -> Result<()> {
 
 /// Save Claude tokens for a specific stored account label.
 pub fn save_claude_tokens_for_account(tokens: &OAuthTokens, label: &str) -> Result<()> {
+    let existing = claude_auth::list_accounts()?
+        .into_iter()
+        .find(|account| account.label == label);
+    let scopes = if tokens.scopes.is_empty() {
+        existing
+            .as_ref()
+            .map(|account| account.scopes.clone())
+            .unwrap_or_default()
+    } else {
+        tokens.scopes.clone()
+    };
     let account = claude_auth::AnthropicAccount {
         label: label.to_string(),
         access: tokens.access_token.clone(),
         refresh: tokens.refresh_token.clone(),
         expires: tokens.expires_at,
-        email: None,
-        subscription_type: None,
+        email: existing.as_ref().and_then(|account| account.email.clone()),
+        subscription_type: existing.and_then(|account| account.subscription_type),
+        scopes,
     };
     claude_auth::upsert_account(account)?;
     Ok(())
@@ -899,6 +991,7 @@ pub fn load_claude_tokens() -> Result<OAuthTokens> {
             refresh_token: creds.refresh_token,
             expires_at: creds.expires_at,
             id_token: None,
+            scopes: creds.scopes,
         });
     }
 
@@ -913,54 +1006,115 @@ pub fn load_claude_tokens_for_account(label: &str) -> Result<OAuthTokens> {
         refresh_token: creds.refresh_token,
         expires_at: creds.expires_at,
         id_token: None,
+        scopes: creds.scopes,
     })
+}
+
+#[derive(Serialize)]
+struct ClaudeRefreshTokenRequest<'a> {
+    grant_type: &'static str,
+    refresh_token: &'a str,
+    client_id: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'static str>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeRefreshTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: i64,
+    scope: Option<String>,
+}
+
+fn claude_refresh_error_is_invalid_scope(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    text.contains("invalid_scope")
+        || text.contains("requested scope is invalid")
+        || text.contains("scope is invalid")
+}
+
+async fn send_claude_refresh_request(
+    refresh_token: &str,
+    scope: Option<&'static str>,
+) -> Result<ClaudeRefreshTokenResponse> {
+    let payload = ClaudeRefreshTokenRequest {
+        grant_type: "refresh_token",
+        refresh_token,
+        client_id: claude::CLIENT_ID,
+        scope,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(claude::TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(CLAUDE_TOKEN_TIMEOUT_SECS))
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let text = resp.text().await?;
+        let scope_label = scope.unwrap_or("<omitted>");
+        anyhow::bail!(
+            "Token refresh failed with scope '{}': {}",
+            scope_label,
+            text
+        );
+    }
+
+    Ok(resp.json().await?)
+}
+
+async fn refresh_claude_tokens_inner(
+    refresh_token: &str,
+    label: Option<&str>,
+) -> Result<OAuthTokens> {
+    let scoped_result =
+        send_claude_refresh_request(refresh_token, Some(claude::REFRESH_SCOPES)).await;
+    let tokens = match scoped_result {
+        Ok(tokens) => tokens,
+        Err(err) if claude_refresh_error_is_invalid_scope(&err) => {
+            crate::logging::warn(
+                "Claude token refresh rejected Claude Code scopes; retrying without an explicit scope for legacy token compatibility",
+            );
+            match send_claude_refresh_request(refresh_token, None).await {
+                Ok(tokens) => tokens,
+                Err(fallback_err) => {
+                    anyhow::bail!(
+                        "Claude token refresh fallback without scope failed: {fallback_err:#}; scoped refresh error: {err:#}"
+                    );
+                }
+            }
+        }
+        Err(err) => return Err(err),
+    };
+
+    let expires_at = chrono::Utc::now().timestamp_millis() + (tokens.expires_in * 1000);
+    let scopes = parse_oauth_scopes(tokens.scope.as_deref());
+    ensure_claude_inference_scope(&scopes, "token refresh")?;
+    let oauth_tokens = OAuthTokens {
+        access_token: tokens.access_token,
+        refresh_token: tokens
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string()),
+        expires_at,
+        id_token: None,
+        scopes,
+    };
+
+    let save_label = label.map(ToString::to_string).unwrap_or_else(|| {
+        claude_auth::active_account_label().unwrap_or_else(claude_auth::primary_account_label)
+    });
+    save_claude_tokens_for_account(&oauth_tokens, &save_label)?;
+
+    Ok(oauth_tokens)
 }
 
 /// Refresh Claude OAuth tokens
 pub async fn refresh_claude_tokens(refresh_token: &str) -> Result<OAuthTokens> {
-    let result: Result<OAuthTokens> = async {
-        let client = reqwest::Client::new();
-        let params = [
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", claude::CLIENT_ID),
-        ];
-        let resp = client
-            .post(claude::TOKEN_URL)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&params)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await?;
-            anyhow::bail!("Token refresh failed: {}", text);
-        }
-
-        #[derive(Deserialize)]
-        struct TokenResponse {
-            access_token: String,
-            refresh_token: String,
-            expires_in: i64,
-        }
-
-        let tokens: TokenResponse = resp.json().await?;
-        let expires_at = chrono::Utc::now().timestamp_millis() + (tokens.expires_in * 1000);
-
-        let oauth_tokens = OAuthTokens {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at,
-            id_token: None,
-        };
-
-        let active_label =
-            claude_auth::active_account_label().unwrap_or_else(claude_auth::primary_account_label);
-        save_claude_tokens_for_account(&oauth_tokens, &active_label)?;
-
-        Ok(oauth_tokens)
-    }
-    .await;
+    let result = refresh_claude_tokens_inner(refresh_token, None).await;
 
     match &result {
         Ok(_) => {
@@ -979,47 +1133,7 @@ pub async fn refresh_claude_tokens_for_account(
     refresh_token: &str,
     label: &str,
 ) -> Result<OAuthTokens> {
-    let result: Result<OAuthTokens> = async {
-        let client = reqwest::Client::new();
-        let params = [
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", claude::CLIENT_ID),
-        ];
-        let resp = client
-            .post(claude::TOKEN_URL)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&params)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await?;
-            anyhow::bail!("Token refresh failed for account '{}': {}", label, text);
-        }
-
-        #[derive(Deserialize)]
-        struct TokenResponse {
-            access_token: String,
-            refresh_token: String,
-            expires_in: i64,
-        }
-
-        let tokens: TokenResponse = resp.json().await?;
-        let expires_at = chrono::Utc::now().timestamp_millis() + (tokens.expires_in * 1000);
-
-        let oauth_tokens = OAuthTokens {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at,
-            id_token: None,
-        };
-
-        save_claude_tokens_for_account(&oauth_tokens, label)?;
-
-        Ok(oauth_tokens)
-    }
-    .await;
+    let result = refresh_claude_tokens_inner(refresh_token, Some(label)).await;
 
     match &result {
         Ok(_) => {
@@ -1103,6 +1217,7 @@ async fn refresh_openai_tokens_inner(
             refresh_token: tokens.refresh_token,
             expires_at,
             id_token: tokens.id_token,
+            scopes: Vec::new(),
         };
 
         if let Some(label) = label {
@@ -1138,39 +1253,49 @@ fn build_claude_exchange_request(
     state: Option<&str>,
 ) -> (String, String, Vec<u8>) {
     let effective_state = state.unwrap_or(verifier);
-    let params = [
-        ("grant_type", "authorization_code".to_string()),
-        ("client_id", claude::CLIENT_ID.to_string()),
-        ("code", code.to_string()),
-        ("code_verifier", verifier.to_string()),
-        ("redirect_uri", redirect_uri.to_string()),
-        ("state", effective_state.to_string()),
-    ];
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(params.iter())
-        .finish();
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": claude::CLIENT_ID,
+        "code_verifier": verifier,
+        "state": effective_state,
+    });
     (
         claude::TOKEN_URL.to_string(),
-        "application/x-www-form-urlencoded".to_string(),
-        body.into_bytes(),
+        "application/json".to_string(),
+        serde_json::to_vec(&body).expect("Claude exchange test body should serialize"),
     )
 }
 
 /// Build a Claude token refresh request (extracted for testability).
 #[cfg(test)]
 fn build_claude_refresh_request(refresh_token: &str) -> (String, String, Vec<u8>) {
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", claude::CLIENT_ID),
-    ];
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(params.iter())
-        .finish();
+    build_claude_refresh_request_with_scope(refresh_token, Some(claude::REFRESH_SCOPES))
+}
+
+/// Build a Claude token refresh request with configurable scope (extracted for testability).
+#[cfg(test)]
+fn build_claude_refresh_request_with_scope(
+    refresh_token: &str,
+    scope: Option<&'static str>,
+) -> (String, String, Vec<u8>) {
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": claude::CLIENT_ID,
+    });
+    let mut body = body.as_object().expect("refresh body object").clone();
+    if let Some(scope) = scope {
+        body.insert(
+            "scope".to_string(),
+            serde_json::Value::String(scope.to_string()),
+        );
+    }
     (
         claude::TOKEN_URL.to_string(),
-        "application/x-www-form-urlencoded".to_string(),
-        body.into_bytes(),
+        "application/json".to_string(),
+        serde_json::to_vec(&body).expect("Claude refresh test body should serialize"),
     )
 }
 
@@ -1221,20 +1346,20 @@ async fn exchange_code_at_url(
     state: Option<&str>,
 ) -> Result<OAuthTokens> {
     let effective_state = state.unwrap_or(verifier);
-    let params = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("client_id", claude::CLIENT_ID.to_string()),
-        ("code", code.to_string()),
-        ("code_verifier", verifier.to_string()),
-        ("redirect_uri", redirect_uri.to_string()),
-        ("state", effective_state.to_string()),
-    ];
+    let payload = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": claude::CLIENT_ID,
+        "code_verifier": verifier,
+        "state": effective_state,
+    });
 
     let client = reqwest::Client::new();
     let resp = client
         .post(token_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&params)
+        .header("Content-Type", "application/json")
+        .json(&payload)
         .send()
         .await?;
 
@@ -1259,6 +1384,7 @@ async fn exchange_code_at_url(
         refresh_token: tokens.refresh_token,
         expires_at,
         id_token: tokens.id_token,
+        scopes: Vec::new(),
     })
 }
 
@@ -1266,17 +1392,18 @@ async fn exchange_code_at_url(
 /// Used by tests with a mock server.
 #[cfg(test)]
 async fn refresh_tokens_at_url(token_url: &str, refresh_token: &str) -> Result<OAuthTokens> {
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", claude::CLIENT_ID),
-    ];
+    let payload = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": claude::CLIENT_ID,
+        "scope": claude::REFRESH_SCOPES,
+    });
 
     let client = reqwest::Client::new();
     let resp = client
         .post(token_url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&params)
+        .header("Content-Type", "application/json")
+        .json(&payload)
         .send()
         .await?;
 
@@ -1300,6 +1427,7 @@ async fn refresh_tokens_at_url(token_url: &str, refresh_token: &str) -> Result<O
         refresh_token: tokens.refresh_token,
         expires_at,
         id_token: None,
+        scopes: Vec::new(),
     })
 }
 

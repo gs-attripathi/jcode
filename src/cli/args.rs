@@ -17,9 +17,13 @@ pub(crate) enum GoogleAccessTierArg {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum PermissionModeArg {
-    Ask,
-    Autopilot,
+pub(crate) enum ProviderAuthArg {
+    /// Send the API key as Authorization: Bearer <key> (OpenAI-compatible default)
+    Bearer,
+    /// Send the API key in an API-key header (defaults to api-key)
+    ApiKey,
+    /// Do not send authentication, useful for localhost model servers
+    None,
 }
 
 #[derive(Parser, Debug)]
@@ -95,7 +99,19 @@ pub(crate) struct Args {
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     /// Start the agent server (background daemon)
-    Serve,
+    Serve {
+        /// Internal: mark this server as temporary so it can self-clean when its owner exits.
+        #[arg(long, hide = true)]
+        temporary_server: bool,
+
+        /// Internal: owning process pid for a temporary server.
+        #[arg(long, hide = true)]
+        owner_pid: Option<u32>,
+
+        /// Internal: idle shutdown timeout in seconds for a temporary server.
+        #[arg(long, hide = true)]
+        temp_idle_timeout_secs: Option<u64>,
+    },
 
     /// Connect to a running server
     Connect,
@@ -147,6 +163,18 @@ pub(crate) enum Command {
         /// Gmail/Google access tier for non-interactive flows. Defaults to full.
         #[arg(long, value_enum)]
         google_access_tier: Option<GoogleAccessTierArg>,
+
+        /// OpenAI-compatible API base URL. Used with --provider openai-compatible/custom profiles.
+        #[arg(long)]
+        api_base: Option<String>,
+
+        /// OpenAI-compatible API key. If omitted, jcode prompts securely when needed.
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// Environment variable name to store/use for an OpenAI-compatible API key.
+        #[arg(long)]
+        api_key_env: Option<String>,
     },
 
     /// Run in simple REPL mode (no TUI)
@@ -227,16 +255,8 @@ pub(crate) enum Command {
         revoke: Option<String>,
     },
 
-    /// Review and respond to pending permission requests
-    Permissions {
-        /// Set the runtime tool permission mode
-        #[arg(long, value_enum)]
-        mode: Option<PermissionModeArg>,
-
-        /// Print the current runtime tool permission mode
-        #[arg(long)]
-        status: bool,
-    },
+    /// Review and respond to pending ambient permission requests
+    Permissions,
 
     /// Inject externally transcribed text into the active Jcode TUI
     Transcript {
@@ -410,6 +430,72 @@ pub(crate) enum ProviderCommand {
     /// Show the currently requested and resolved provider selection
     Current {
         /// Emit JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Add a named OpenAI-compatible API provider profile
+    Add {
+        /// Profile name used with --provider-profile and config defaults, e.g. my-gateway
+        name: String,
+
+        /// OpenAI-compatible API base URL, e.g. https://llm.example.com/v1
+        #[arg(long, alias = "api-base")]
+        base_url: String,
+
+        /// Default model id for this provider profile
+        #[arg(short, long)]
+        model: String,
+
+        /// Optional model context window in tokens
+        #[arg(long)]
+        context_window: Option<usize>,
+
+        /// Environment variable name that contains the API key
+        #[arg(long, conflicts_with = "no_api_key")]
+        api_key_env: Option<String>,
+
+        /// API key value to store in jcode's private provider env file. Prefer --api-key-stdin for shell history safety.
+        #[arg(long, conflicts_with_all = ["api_key_stdin", "no_api_key"])]
+        api_key: Option<String>,
+
+        /// Read the API key from stdin and store it in jcode's private provider env file
+        #[arg(long, conflicts_with = "no_api_key")]
+        api_key_stdin: bool,
+
+        /// Configure the provider with no API key/authentication
+        #[arg(long, conflicts_with_all = ["api_key", "api_key_stdin", "api_key_env"])]
+        no_api_key: bool,
+
+        /// Authentication style for the API key
+        #[arg(long, value_enum)]
+        auth: Option<ProviderAuthArg>,
+
+        /// Header name when --auth api-key is used (default: api-key)
+        #[arg(long)]
+        auth_header: Option<String>,
+
+        /// Private env file name under jcode's app config directory for stored API keys
+        #[arg(long)]
+        env_file: Option<String>,
+
+        /// Make this profile the startup default provider/model
+        #[arg(long, alias = "default")]
+        set_default: bool,
+
+        /// Replace an existing profile with the same name
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Allow provider-routing features for OpenRouter-style gateways
+        #[arg(long)]
+        provider_routing: bool,
+
+        /// Fetch/list models from the provider's /models endpoint
+        #[arg(long)]
+        model_catalog: bool,
+
+        /// Emit JSON instead of human-readable setup output
         #[arg(long)]
         json: bool,
     },

@@ -25,6 +25,111 @@ const DEFAULT_SWARM_STATUS_DEBOUNCE_MS: u64 = 75;
 const DEFAULT_SWARM_TASK_HEARTBEAT_SECS: u64 = 10;
 const DEFAULT_SWARM_TASK_STALE_AFTER_SECS: u64 = 45;
 const DEFAULT_SWARM_TASK_SWEEP_INTERVAL_SECS: u64 = 5;
+const MAX_SWARM_COMPLETION_REPORT_CHARS: usize = 4000;
+const SWARM_COMPLETION_REPORT_MARKER: &str = "SWARM COMPLETION REPORT REQUIRED";
+
+pub(super) fn append_swarm_completion_report_instructions(message: &str) -> String {
+    if message.contains(SWARM_COMPLETION_REPORT_MARKER) {
+        return message.to_string();
+    }
+
+    let mut out = message.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str("<system-reminder>\n");
+    out.push_str(SWARM_COMPLETION_REPORT_MARKER);
+    out.push_str(
+        "\nBefore finishing, call the swarm tool with action=\"report\" to submit your completion report. \
+Include a concise message, validation/tests performed, and blockers or follow-ups. \
+After the report tool succeeds, also write a brief final assistant response. \
+Do not finish with only tool output, a lifecycle status change, or no final response. \
+Do not send a separate DM for the final report unless you need interactive coordination before finishing.\n",
+    );
+    out.push_str("</system-reminder>");
+    out
+}
+
+pub(super) fn format_structured_completion_report(
+    message: &str,
+    validation: Option<&str>,
+    follow_up: Option<&str>,
+) -> String {
+    let mut report = message.trim().to_string();
+    if let Some(validation) = validation.map(str::trim).filter(|value| !value.is_empty()) {
+        if !report.is_empty() {
+            report.push_str("\n\n");
+        }
+        report.push_str("Validation:\n");
+        report.push_str(validation);
+    }
+    if let Some(follow_up) = follow_up.map(str::trim).filter(|value| !value.is_empty()) {
+        if !report.is_empty() {
+            report.push_str("\n\n");
+        }
+        report.push_str("Follow-ups/blockers:\n");
+        report.push_str(follow_up);
+    }
+    report
+}
+
+fn normalize_completion_report(report: Option<String>) -> Option<String> {
+    let report = report?.trim().to_string();
+    if report.is_empty() {
+        return None;
+    }
+
+    let char_count = report.chars().count();
+    if char_count <= MAX_SWARM_COMPLETION_REPORT_CHARS {
+        return Some(report);
+    }
+
+    let suffix = "\n\n[Report truncated by jcode before delivery.]";
+    let keep_chars = MAX_SWARM_COMPLETION_REPORT_CHARS.saturating_sub(suffix.chars().count());
+    let mut truncated: String = report.chars().take(keep_chars).collect();
+    truncated.push_str(suffix);
+    Some(truncated)
+}
+
+fn completion_status_intro(name: &str, status: &str) -> String {
+    match status {
+        "ready" => format!("Agent {} finished their work and is ready for more.", name),
+        "failed" => format!("Agent {} finished with status failed.", name),
+        "stopped" => format!("Agent {} stopped.", name),
+        _ => format!("Agent {} completed their work.", name),
+    }
+}
+
+fn completion_followup(status: &str, has_report: bool) -> &'static str {
+    match (status, has_report) {
+        ("ready", true) => {
+            "Use assign_task to give them more work, stop to remove them, or summary/read_context for full context."
+        }
+        ("ready", false) => {
+            "Use summary/read_context to inspect results, assign_task for more work, or stop to remove them."
+        }
+        ("failed", true) => {
+            "Use summary/read_context for full context, retry with guidance, or stop to remove them."
+        }
+        ("failed", false) => {
+            "Use summary/read_context to inspect results, assign_task to retry with guidance, or stop to remove them."
+        }
+        ("stopped", _) => "Use summary/read_context to inspect results or stop to remove them.",
+        (_, true) => {
+            "Use assign_task to give them new work, stop to remove them, or summary/read_context for full context."
+        }
+        (_, false) => "Use assign_task to give them new work, or stop to remove them.",
+    }
+}
+
+fn completion_notification_message(name: &str, status: &str, report: Option<&str>) -> String {
+    let intro = completion_status_intro(name, status);
+    let followup = completion_followup(status, report.is_some());
+    match report {
+        Some(report) => format!("{intro}\n\nReport:\n{report}\n\n{followup}"),
+        None => format!("{intro}\n\nNo final textual report was produced. {followup}"),
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 struct PendingSwarmStatusBroadcast {
@@ -682,6 +787,36 @@ pub(super) async fn update_member_status(
     event_counter: Option<&Arc<std::sync::atomic::AtomicU64>>,
     swarm_event_tx: Option<&broadcast::Sender<SwarmEvent>>,
 ) {
+    update_member_status_with_report(
+        session_id,
+        status,
+        detail,
+        None,
+        swarm_members,
+        swarms_by_id,
+        event_history,
+        event_counter,
+        swarm_event_tx,
+    )
+    .await;
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "member status updates need swarm membership, broadcast state, optional report text, and event history sinks"
+)]
+pub(super) async fn update_member_status_with_report(
+    session_id: &str,
+    status: &str,
+    detail: Option<String>,
+    completion_report: Option<String>,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    event_history: Option<&Arc<RwLock<std::collections::VecDeque<SwarmEvent>>>>,
+    event_counter: Option<&Arc<std::sync::atomic::AtomicU64>>,
+    swarm_event_tx: Option<&broadcast::Sender<SwarmEvent>>,
+) {
+    let completion_report = normalize_completion_report(completion_report);
     let (
         swarm_id,
         agent_name,
@@ -696,7 +831,9 @@ pub(super) async fn update_member_status(
             let previous_status = member.status.clone();
             let status_changed = member.status != status;
             let detail_changed = member.detail != detail;
-            let member_changed = status_changed || detail_changed;
+            let report_changed =
+                completion_report.is_some() && member.latest_completion_report != completion_report;
+            let member_changed = status_changed || detail_changed || report_changed;
             if status_changed {
                 member.last_status_change = Instant::now();
             }
@@ -705,6 +842,9 @@ pub(super) async fn update_member_status(
             let report_back_to_session_id = member.report_back_to_session_id.clone();
             member.status = status.to_string();
             member.detail = detail;
+            if completion_report.is_some() {
+                member.latest_completion_report = completion_report.clone();
+            }
             (
                 member.swarm_id.clone(),
                 name,
@@ -772,24 +912,8 @@ pub(super) async fn update_member_status(
                 let name = agent_name
                     .as_deref()
                     .unwrap_or(&session_id[..8.min(session_id.len())]);
-                let msg = match status {
-                    "ready" => format!(
-                        "Agent {} finished their work and is ready for more. Use summary/read_context to inspect results, assign_task for more work, or stop to remove them.",
-                        name
-                    ),
-                    "failed" => format!(
-                        "Agent {} finished with status failed. Use summary/read_context to inspect results, assign_task to retry with guidance, or stop to remove them.",
-                        name
-                    ),
-                    "stopped" => format!(
-                        "Agent {} stopped. Use summary/read_context to inspect results or stop to remove them.",
-                        name
-                    ),
-                    _ => format!(
-                        "Agent {} completed their work. Use assign_task to give them new work, or stop to remove them.",
-                        name
-                    ),
-                };
+                let msg =
+                    completion_notification_message(name, status, completion_report.as_deref());
                 let _ = fanout_session_event(
                     swarm_members,
                     &recipient_session_id,
@@ -968,9 +1092,10 @@ fn parse_swarm_tasks(text: &str) -> Vec<SwarmTaskSpec> {
 #[cfg(test)]
 mod tests {
     use super::{
-        broadcast_swarm_plan_with_previous, now_unix_ms, parse_swarm_tasks,
-        refresh_swarm_task_staleness, remove_session_from_swarm, summarize_plan_items,
-        touch_swarm_task_progress, truncate_detail, update_member_status,
+        append_swarm_completion_report_instructions, broadcast_swarm_plan_with_previous,
+        now_unix_ms, parse_swarm_tasks, refresh_swarm_task_staleness, remove_session_from_swarm,
+        summarize_plan_items, touch_swarm_task_progress, truncate_detail, update_member_status,
+        update_member_status_with_report,
     };
     use crate::plan::PlanItem;
     use crate::protocol::{NotificationType, ServerEvent};
@@ -1024,6 +1149,20 @@ mod tests {
         assert_eq!(tasks[0].subagent_type.as_deref(), Some("general"));
     }
 
+    #[test]
+    fn append_swarm_completion_report_instructions_is_idempotent() {
+        let prompt = "Implement the task.";
+        let with_instructions = append_swarm_completion_report_instructions(prompt);
+
+        assert!(with_instructions.starts_with(prompt));
+        assert!(with_instructions.contains("SWARM COMPLETION REPORT REQUIRED"));
+        assert!(with_instructions.contains("automatically deliver"));
+        assert_eq!(
+            append_swarm_completion_report_instructions(&with_instructions),
+            with_instructions
+        );
+    }
+
     fn swarm_member(
         session_id: &str,
         role: &str,
@@ -1042,6 +1181,7 @@ mod tests {
                 detail: None,
                 friendly_name: Some(session_id.to_string()),
                 report_back_to_session_id: None,
+                latest_completion_report: None,
                 role: role.to_string(),
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
@@ -1349,6 +1489,51 @@ mod tests {
                     message,
                     ..
                 } if message.contains("finished their work and is ready for more")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn update_member_status_includes_completion_report_in_owner_notification() {
+        let swarm_members = Arc::new(RwLock::new(HashMap::new()));
+        let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
+            "swarm-1".to_string(),
+            HashSet::from(["coord".to_string(), "worker".to_string()]),
+        )])));
+
+        let (coord, mut coord_rx) = swarm_member("coord", "coordinator", false);
+        let (mut worker, _worker_rx) = swarm_member("worker", "agent", true);
+        worker.status = "running".to_string();
+        worker.report_back_to_session_id = Some("coord".to_string());
+        {
+            let mut members = swarm_members.write().await;
+            members.insert("coord".to_string(), coord);
+            members.insert("worker".to_string(), worker);
+        }
+
+        update_member_status_with_report(
+            "worker",
+            "ready",
+            None,
+            Some("Validated the parser and all tests passed.".to_string()),
+            &swarm_members,
+            &swarms_by_id,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let events: Vec<_> = std::iter::from_fn(|| coord_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::Notification {
+                    notification_type: NotificationType::Message { .. },
+                    message,
+                    ..
+                } if message.contains("Report:\nValidated the parser")
+                    && !message.contains("No final textual report")
             )
         }));
     }

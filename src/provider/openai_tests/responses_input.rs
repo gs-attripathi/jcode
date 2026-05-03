@@ -1,147 +1,143 @@
+fn assistant_tool_use(id: &str, name: &str, input: serde_json::Value) -> ChatMessage {
+    ChatMessage {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }
+}
+
+fn user_text(text: &str) -> ChatMessage {
+    ChatMessage {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }
+}
+
+fn response_item_type(item: &serde_json::Value) -> Option<&str> {
+    item.get("type").and_then(|v| v.as_str())
+}
+
+fn response_item_call_id(item: &serde_json::Value) -> Option<&str> {
+    item.get("call_id").and_then(|v| v.as_str())
+}
+
+fn function_call_pos(items: &[serde_json::Value], call_id: &str) -> Option<usize> {
+    items.iter().position(|item| {
+        response_item_type(item) == Some("function_call")
+            && response_item_call_id(item) == Some(call_id)
+    })
+}
+
+fn function_call_output_pos(items: &[serde_json::Value], call_id: &str) -> Option<usize> {
+    items.iter().position(|item| {
+        response_item_type(item) == Some("function_call_output")
+            && response_item_call_id(item) == Some(call_id)
+    })
+}
+
+fn function_call_outputs(items: &[serde_json::Value], call_id: &str) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| {
+            response_item_type(item) == Some("function_call_output")
+                && response_item_call_id(item) == Some(call_id)
+        })
+        .filter_map(|item| item.get("output").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors the request builder to keep call sites explicit"
+)]
+fn build_test_response_request(
+    model_id: &str,
+    is_chatgpt_mode: bool,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
+    prompt_cache_key: Option<&str>,
+    prompt_cache_retention: Option<&str>,
+    native_compaction_threshold: Option<usize>,
+) -> serde_json::Value {
+    OpenAIProvider::build_response_request(
+        model_id,
+        "system".to_string(),
+        &[],
+        &[],
+        is_chatgpt_mode,
+        max_output_tokens,
+        reasoning_effort,
+        service_tier,
+        prompt_cache_key,
+        prompt_cache_retention,
+        native_compaction_threshold,
+    )
+}
+
 #[test]
 fn test_build_responses_input_injects_missing_tool_output() {
     let expected_missing = format!("[Error] {}", TOOL_OUTPUT_MISSING_TEXT);
     let messages = vec![
-        ChatMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "hi".to_string(),
-                cache_control: None,
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "bash".to_string(),
-                input: serde_json::json!({"command": "ls"}),
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
+        user_text("hi"),
+        assistant_tool_use("call_1", "bash", serde_json::json!({"command": "ls"})),
     ];
 
     let items = build_responses_input(&messages);
-    let mut saw_call = false;
-    let mut saw_output = false;
-
-    for item in &items {
-        let item_type = item.get("type").and_then(|v| v.as_str());
-        match item_type {
-            Some("function_call") => {
-                if item.get("call_id").and_then(|v| v.as_str()) == Some("call_1") {
-                    saw_call = true;
-                }
-            }
-            Some("function_call_output") => {
-                if item.get("call_id").and_then(|v| v.as_str()) == Some("call_1") {
-                    let output = item.get("output").and_then(|v| v.as_str());
-                    assert_eq!(output, Some(expected_missing.as_str()));
-                    saw_output = true;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    assert!(saw_call);
-    assert!(saw_output);
+    assert!(function_call_pos(&items, "call_1").is_some());
+    assert_eq!(
+        function_call_outputs(&items, "call_1"),
+        vec![expected_missing]
+    );
 }
 
 #[test]
 fn test_build_responses_input_preserves_tool_output() {
     let messages = vec![
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "bash".to_string(),
-                input: serde_json::json!({"command": "ls"}),
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
+        assistant_tool_use("call_1", "bash", serde_json::json!({"command": "ls"})),
         ChatMessage::tool_result("call_1", "ok", false),
     ];
 
     let items = build_responses_input(&messages);
-    let mut outputs = Vec::new();
-
-    for item in &items {
-        if item.get("type").and_then(|v| v.as_str()) == Some("function_call_output")
-            && item.get("call_id").and_then(|v| v.as_str()) == Some("call_1")
-            && let Some(output) = item.get("output").and_then(|v| v.as_str())
-        {
-            outputs.push(output.to_string());
-        }
-    }
-
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0], "ok");
+    assert_eq!(function_call_outputs(&items, "call_1"), vec!["ok"]);
 }
 
 #[test]
 fn test_build_responses_input_reorders_early_tool_output() {
     let messages = vec![
         ChatMessage::tool_result("call_1", "ok", false),
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "bash".to_string(),
-                input: serde_json::json!({"command": "ls"}),
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
+        assistant_tool_use("call_1", "bash", serde_json::json!({"command": "ls"})),
     ];
 
     let items = build_responses_input(&messages);
-    let mut call_pos = None;
-    let mut output_pos = None;
-    let mut outputs = Vec::new();
-
-    for (idx, item) in items.iter().enumerate() {
-        let item_type = item.get("type").and_then(|v| v.as_str());
-        match item_type {
-            Some("function_call") => {
-                if item.get("call_id").and_then(|v| v.as_str()) == Some("call_1") {
-                    call_pos = Some(idx);
-                }
-            }
-            Some("function_call_output") => {
-                if item.get("call_id").and_then(|v| v.as_str()) == Some("call_1") {
-                    output_pos = Some(idx);
-                    if let Some(output) = item.get("output").and_then(|v| v.as_str()) {
-                        outputs.push(output.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let call_pos = function_call_pos(&items, "call_1");
+    let output_pos = function_call_output_pos(&items, "call_1");
 
     assert!(call_pos.is_some());
     assert!(output_pos.is_some());
     assert!(output_pos.unwrap() > call_pos.unwrap());
-    assert_eq!(outputs, vec!["ok".to_string()]);
+    assert_eq!(function_call_outputs(&items, "call_1"), vec!["ok"]);
 }
 
 #[test]
 fn test_build_responses_input_keeps_image_context_after_tool_output() {
     let messages = vec![
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "read".to_string(),
-                input: serde_json::json!({"file_path": "screenshot.png"}),
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
+        assistant_tool_use(
+            "call_1",
+            "read",
+            serde_json::json!({"file_path": "screenshot.png"}),
+        ),
         ChatMessage {
             role: Role::User,
             content: vec![
@@ -168,20 +164,11 @@ fn test_build_responses_input_keeps_image_context_after_tool_output() {
     ];
 
     let items = build_responses_input(&messages);
-    let mut output_pos = None;
+    let output_pos = function_call_output_pos(&items, "call_1");
     let mut image_msg_pos = None;
 
     for (idx, item) in items.iter().enumerate() {
-        match item.get("type").and_then(|v| v.as_str()) {
-            Some("function_call_output")
-                if item.get("call_id").and_then(|v| v.as_str()) == Some("call_1") =>
-            {
-                output_pos = Some(idx);
-                assert_eq!(
-                    item.get("output").and_then(|v| v.as_str()),
-                    Some("Image: screenshot.png\nImage sent to model for vision analysis.")
-                );
-            }
+        match response_item_type(item) {
             Some("message") if item.get("role").and_then(|v| v.as_str()) == Some("user") => {
                 let Some(content) = item.get("content").and_then(|v| v.as_array()) else {
                     continue;
@@ -205,6 +192,10 @@ fn test_build_responses_input_keeps_image_context_after_tool_output() {
         }
     }
 
+    assert_eq!(
+        function_call_outputs(&items, "call_1"),
+        vec!["Image: screenshot.png\nImage sent to model for vision analysis."]
+    );
     assert!(output_pos.is_some(), "expected function call output item");
     assert!(
         image_msg_pos.is_some(),
@@ -220,55 +211,18 @@ fn test_build_responses_input_keeps_image_context_after_tool_output() {
 fn test_build_responses_input_injects_only_missing_outputs() {
     let expected_missing = format!("[Error] {}", TOOL_OUTPUT_MISSING_TEXT);
     let messages = vec![
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call_a".to_string(),
-                name: "bash".to_string(),
-                input: serde_json::json!({"command": "pwd"}),
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolUse {
-                id: "call_b".to_string(),
-                name: "bash".to_string(),
-                input: serde_json::json!({"command": "whoami"}),
-            }],
-            timestamp: None,
-            tool_duration_ms: None,
-        },
+        assistant_tool_use("call_a", "bash", serde_json::json!({"command": "pwd"})),
+        assistant_tool_use("call_b", "bash", serde_json::json!({"command": "whoami"})),
         ChatMessage::tool_result("call_b", "done", false),
     ];
 
     let items = build_responses_input(&messages);
-    let mut output_a = None;
-    let mut output_b = None;
 
-    for item in &items {
-        if item.get("type").and_then(|v| v.as_str()) == Some("function_call_output") {
-            match item.get("call_id").and_then(|v| v.as_str()) {
-                Some("call_a") => {
-                    output_a = item
-                        .get("output")
-                        .and_then(|v| v.as_str())
-                        .map(|v| v.to_string());
-                }
-                Some("call_b") => {
-                    output_b = item
-                        .get("output")
-                        .and_then(|v| v.as_str())
-                        .map(|v| v.to_string());
-                }
-                _ => {}
-            }
-        }
-    }
-
-    assert_eq!(output_a.as_deref(), Some(expected_missing.as_str()));
-    assert_eq!(output_b.as_deref(), Some("done"));
+    assert_eq!(
+        function_call_outputs(&items, "call_a"),
+        vec![expected_missing]
+    );
+    assert_eq!(function_call_outputs(&items, "call_b"), vec!["done"]);
 }
 
 #[test]
@@ -311,11 +265,8 @@ fn test_parse_max_output_tokens_allows_disable_and_override() {
 
 #[test]
 fn test_build_response_request_for_gpt_5_4_1m_uses_base_model_without_extra_flags() {
-    let request = OpenAIProvider::build_response_request(
+    let request = build_test_response_request(
         "gpt-5.4",
-        "system".to_string(),
-        &[],
-        &[],
         true,
         Some(DEFAULT_MAX_OUTPUT_TOKENS),
         Some("xhigh"),
@@ -330,15 +281,23 @@ fn test_build_response_request_for_gpt_5_4_1m_uses_base_model_without_extra_flag
     assert!(request.get("max_output_tokens").is_none());
     assert!(request.get("prompt_cache_key").is_none());
     assert!(request.get("prompt_cache_retention").is_none());
+    assert_eq!(
+        request["reasoning"],
+        serde_json::json!({ "effort": "xhigh" })
+    );
+    assert_eq!(request["service_tier"], serde_json::json!("unused"));
+    assert!(
+        request["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .contains(&serde_json::json!({ "type": "image_generation" }))
+    );
 }
 
 #[test]
 fn test_build_response_request_omits_long_context_for_plain_gpt_5_4() {
-    let request = OpenAIProvider::build_response_request(
+    let request = build_test_response_request(
         "gpt-5.4",
-        "system".to_string(),
-        &[],
-        &[],
         true,
         Some(DEFAULT_MAX_OUTPUT_TOKENS),
         None,
@@ -349,4 +308,55 @@ fn test_build_response_request_omits_long_context_for_plain_gpt_5_4() {
     );
 
     assert!(request.get("model_context_window").is_none());
+}
+
+#[test]
+fn test_build_response_request_defaults_extended_cache_retention_for_gpt_5_5() {
+    let request = build_test_response_request(
+        "gpt-5.5",
+        false,
+        Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(request["prompt_cache_retention"], serde_json::json!("24h"));
+    assert_eq!(
+        request["max_output_tokens"],
+        serde_json::json!(DEFAULT_MAX_OUTPUT_TOKENS)
+    );
+}
+
+#[test]
+fn test_build_response_request_respects_configured_cache_retention() {
+    let request = build_test_response_request(
+        "gpt-5.5",
+        false,
+        Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        None,
+        None,
+        None,
+        Some("in_memory"),
+        None,
+    );
+
+    assert_eq!(
+        request["prompt_cache_retention"],
+        serde_json::json!("in_memory")
+    );
+}
+
+#[test]
+fn test_openai_cache_ttl_is_model_aware() {
+    assert_eq!(
+        crate::tui::cache_ttl_for_provider_model("openai", Some("gpt-5.5")),
+        Some(24 * 60 * 60)
+    );
+    assert_eq!(
+        crate::tui::cache_ttl_for_provider_model("openai", Some("gpt-4o")),
+        Some(300)
+    );
 }

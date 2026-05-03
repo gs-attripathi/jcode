@@ -5,7 +5,24 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::config::ToolPermissionMode;
+// Re-port of the pre-merge ToolPermissionMode that the upstream branch
+// didn't carry forward. Kept inline here so the safety logic that
+// references it still compiles after merging upstream's protocol
+// refactor. If upstream introduces an equivalent later, replace this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPermissionMode {
+    Ask,
+    Autopilot,
+}
+
+impl ToolPermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Autopilot => "autopilot",
+        }
+    }
+}
 use crate::notifications::NotificationDispatcher;
 use crate::storage;
 

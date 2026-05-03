@@ -10,6 +10,7 @@ pub enum AuthFailureReason {
     ImportUnavailable,
     ExternalCliFailed,
     DeviceFlowFailed,
+    RateLimited,
     OAuthExchangeFailed,
     Unknown,
 }
@@ -27,6 +28,7 @@ impl AuthFailureReason {
             Self::ImportUnavailable => "import_unavailable",
             Self::ExternalCliFailed => "external_cli_failed",
             Self::DeviceFlowFailed => "device_flow_failed",
+            Self::RateLimited => "rate_limited",
             Self::OAuthExchangeFailed => "oauth_exchange_failed",
             Self::Unknown => "unknown",
         }
@@ -67,6 +69,13 @@ pub fn classify_auth_failure_message(message: &str) -> AuthFailureReason {
         AuthFailureReason::ImportUnavailable
     } else if lower.contains("device flow failed") {
         AuthFailureReason::DeviceFlowFailed
+    } else if lower.contains("rate_limit_error")
+        || lower.contains("rate limited")
+        || lower.contains("too many requests")
+        || lower.contains("http 429")
+        || lower.contains("status 429")
+    {
+        AuthFailureReason::RateLimited
     } else if lower.contains("cli login failed")
         || lower.contains("command exited with non-zero status")
         || lower.contains("failed to start command")
@@ -115,6 +124,10 @@ pub fn auth_failure_recovery_hint(provider_id: &str, reason: AuthFailureReason) 
         AuthFailureReason::DeviceFlowFailed => {
             "Retry the device-code flow, or switch to another supported auth method if available.".to_string()
         }
+        AuthFailureReason::RateLimited => format!(
+            "The provider accepted the browser callback but rate-limited the token exchange. Wait before retrying, avoid repeated immediate attempts, and keep using existing credentials if they still validate with `jcode auth doctor {} --validate`.",
+            provider
+        ),
         AuthFailureReason::OAuthExchangeFailed => format!(
             "Retry the OAuth flow, and if it keeps failing use `jcode login --provider {} --print-auth-url` so the callback can be completed manually.",
             provider
@@ -154,6 +167,16 @@ mod tests {
         assert_eq!(
             classify_auth_failure_message("Post-login validation failed for OpenAI."),
             AuthFailureReason::PostLoginValidationFailed
+        );
+    }
+
+    #[test]
+    fn classifies_oauth_rate_limit() {
+        assert_eq!(
+            classify_auth_failure_message(
+                r#"Token exchange failed: {"error":{"type":"rate_limit_error","message":"Rate limited. Please try again later."}}"#,
+            ),
+            AuthFailureReason::RateLimited
         );
     }
 

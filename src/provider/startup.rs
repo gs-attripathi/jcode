@@ -49,6 +49,33 @@ impl MultiProvider {
 
     pub(super) fn new_with_auth_status(auth_status: auth::AuthStatus) -> Self {
         let provider_init_start = std::time::Instant::now();
+        let cfg = crate::config::config();
+        let mut default_named_provider_profile: Option<String> = None;
+        if std::env::var_os("JCODE_PROVIDER_PROFILE_ACTIVE").is_none()
+            && std::env::var_os("JCODE_NAMED_PROVIDER_PROFILE").is_none()
+            && let Some(pref) = cfg.provider.default_provider.as_deref()
+        {
+            if let Some(profile) =
+                crate::provider_catalog::resolve_openai_compatible_profile_selection(pref)
+            {
+                crate::provider_catalog::apply_openai_compatible_profile_env(Some(profile));
+            } else if cfg.providers.contains_key(pref) {
+                match crate::provider_catalog::apply_named_provider_profile_env_from_config(
+                    pref, cfg,
+                ) {
+                    Ok(profile_name) => {
+                        crate::env::set_var("JCODE_PROVIDER_PROFILE_NAME", &profile_name);
+                        crate::env::set_var("JCODE_PROVIDER_PROFILE_ACTIVE", "1");
+                        default_named_provider_profile = Some(profile_name);
+                    }
+                    Err(err) => crate::logging::warn(&format!(
+                        "Failed to apply default provider profile '{}': {}",
+                        pref, err
+                    )),
+                }
+            }
+        }
+
         let has_claude_creds = auth::claude::load_credentials().is_ok();
         let has_openai_creds = auth::codex::load_credentials().is_ok();
         let has_copilot_api = auth_status.copilot_has_api_token;
@@ -140,7 +167,22 @@ impl MultiProvider {
         };
 
         let openrouter = if has_openrouter_creds {
-            match openrouter::OpenRouterProvider::new() {
+            let named_profile = std::env::var("JCODE_NAMED_PROVIDER_PROFILE")
+                .ok()
+                .or_else(|| default_named_provider_profile.clone());
+            let provider_result = if let Some(profile_name) = named_profile.as_deref() {
+                if let Some(profile) = cfg.providers.get(profile_name) {
+                    openrouter::OpenRouterProvider::new_named_openai_compatible(
+                        profile_name,
+                        profile,
+                    )
+                } else {
+                    openrouter::OpenRouterProvider::new()
+                }
+            } else {
+                openrouter::OpenRouterProvider::new()
+            };
+            match provider_result {
                 Ok(p) => Some(Arc::new(p)),
                 Err(e) => {
                     crate::logging::info(&format!("Failed to initialize OpenRouter: {}", e));
@@ -174,14 +216,19 @@ impl MultiProvider {
         }
 
         let forced_provider = Self::forced_provider_from_env();
-        let cfg = crate::config::config();
         if let Some(forced) = forced_provider {
             active = forced;
             let is_configured = availability.is_configured(forced);
             if is_configured {
+                let display = if matches!(forced, ActiveProvider::OpenRouter) {
+                    crate::provider_catalog::active_openai_compatible_display_name()
+                        .unwrap_or_else(|| Self::provider_key(forced).to_string())
+                } else {
+                    Self::provider_key(forced).to_string()
+                };
                 crate::logging::info(&format!(
                     "Using forced provider '{}' from CLI/environment",
-                    Self::provider_key(forced)
+                    display
                 ));
             } else {
                 crate::logging::warn(&format!(
@@ -190,7 +237,39 @@ impl MultiProvider {
                 ));
             }
         } else if let Some(ref pref) = cfg.provider.default_provider {
-            if let Some(pref_provider) = Self::parse_provider_hint(pref) {
+            if let Some(profile) =
+                crate::provider_catalog::resolve_openai_compatible_profile_selection(pref)
+            {
+                let is_configured = availability.is_configured(ActiveProvider::OpenRouter);
+                if is_configured {
+                    active = ActiveProvider::OpenRouter;
+                    let resolved =
+                        crate::provider_catalog::resolve_openai_compatible_profile(profile);
+                    crate::logging::info(&format!(
+                        "Using preferred provider '{}' from config via OpenAI-compatible profile {}",
+                        pref, resolved.display_name
+                    ));
+                } else {
+                    crate::logging::warn(&format!(
+                        "Preferred provider '{}' is not configured, using auto-detected default",
+                        pref
+                    ));
+                }
+            } else if cfg.providers.contains_key(pref) {
+                let is_configured = availability.is_configured(ActiveProvider::OpenRouter);
+                if is_configured {
+                    active = ActiveProvider::OpenRouter;
+                    crate::logging::info(&format!(
+                        "Using preferred provider profile '{}' from config",
+                        pref
+                    ));
+                } else {
+                    crate::logging::warn(&format!(
+                        "Preferred provider profile '{}' is not configured, using auto-detected default",
+                        pref
+                    ));
+                }
+            } else if let Some(pref_provider) = Self::parse_provider_hint(pref) {
                 let is_configured = availability.is_configured(pref_provider);
                 if is_configured {
                     active = pref_provider;
@@ -206,7 +285,7 @@ impl MultiProvider {
                 }
             } else {
                 crate::logging::warn(&format!(
-                    "Unknown default_provider '{}' in config (expected: claude|openai|copilot|antigravity|gemini|cursor|openrouter)",
+                    "Unknown default_provider '{}' in config (expected: claude|openai|copilot|antigravity|gemini|cursor|openrouter or an OpenAI-compatible profile such as deepseek|zai|openai-compatible)",
                     pref
                 ));
             }

@@ -1,6 +1,6 @@
 use super::{
-    SelfDevBuildCommand, canary_binary_path, current_binary_path, shared_server_binary_path,
-    stable_binary_path,
+    SelfDevBuildCommand, SelfDevBuildTarget, canary_binary_path, current_binary_path,
+    shared_server_binary_path, stable_binary_path,
 };
 use crate::storage;
 use anyhow::Result;
@@ -94,44 +94,116 @@ fn newest_existing_binary(
         .max_by_key(|(path, _)| binary_mtime(path))
 }
 
+fn existing_binary(path: Result<PathBuf>, label: &'static str) -> Option<(PathBuf, &'static str)> {
+    path.ok()
+        .filter(|path| path.exists())
+        .map(|path| (path, label))
+}
+
 pub fn selfdev_build_command(repo_dir: &Path) -> SelfDevBuildCommand {
+    selfdev_build_command_for_target(repo_dir, SelfDevBuildTarget::Auto)
+}
+
+pub fn selfdev_build_command_for_target(
+    repo_dir: &Path,
+    target: SelfDevBuildTarget,
+) -> SelfDevBuildCommand {
+    let target = match target {
+        SelfDevBuildTarget::Auto => infer_selfdev_build_target(repo_dir),
+        explicit => explicit,
+    };
+    let specs = match target {
+        SelfDevBuildTarget::Tui => vec![("jcode", "jcode")],
+        SelfDevBuildTarget::Desktop => vec![("jcode-desktop", "jcode-desktop")],
+        SelfDevBuildTarget::All | SelfDevBuildTarget::Auto => {
+            vec![("jcode", "jcode"), ("jcode-desktop", "jcode-desktop")]
+        }
+    };
     let wrapper = repo_dir.join("scripts").join("dev_cargo.sh");
     if wrapper.is_file() {
+        let script = wrapper.to_string_lossy();
+        let command = specs
+            .iter()
+            .map(|(package, binary)| {
+                format!(
+                    "{} build --profile {} -p {} --bin {}",
+                    shell_escape(&script),
+                    SELFDEV_CARGO_PROFILE,
+                    package,
+                    binary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" && ");
         return SelfDevBuildCommand {
             program: "bash".to_string(),
-            args: vec![
-                wrapper.to_string_lossy().into_owned(),
-                "build".to_string(),
-                "--profile".to_string(),
-                SELFDEV_CARGO_PROFILE.to_string(),
-                "-p".to_string(),
-                "jcode".to_string(),
-                "--bin".to_string(),
-                "jcode".to_string(),
-            ],
-            display: format!(
-                "scripts/dev_cargo.sh build --profile {} -p jcode --bin jcode",
-                SELFDEV_CARGO_PROFILE
-            ),
+            args: vec!["-lc".to_string(), command],
+            display: display_build_command("scripts/dev_cargo.sh", &specs),
         };
     }
 
+    let command = display_build_command("cargo", &specs);
     SelfDevBuildCommand {
-        program: "cargo".to_string(),
-        args: vec![
-            "build".to_string(),
-            "--profile".to_string(),
-            SELFDEV_CARGO_PROFILE.to_string(),
-            "-p".to_string(),
-            "jcode".to_string(),
-            "--bin".to_string(),
-            "jcode".to_string(),
-        ],
-        display: format!(
-            "cargo build --profile {} -p jcode --bin jcode",
-            SELFDEV_CARGO_PROFILE
-        ),
+        program: "bash".to_string(),
+        args: vec!["-lc".to_string(), command.clone()],
+        display: command,
     }
+}
+
+fn display_build_command(program: &str, specs: &[(&str, &str)]) -> String {
+    specs
+        .iter()
+        .map(|(package, binary)| {
+            format!(
+                "{} build --profile {} -p {} --bin {}",
+                program, SELFDEV_CARGO_PROFILE, package, binary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+fn infer_selfdev_build_target(repo_dir: &Path) -> SelfDevBuildTarget {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(repo_dir)
+        .output();
+    let Ok(output) = output else {
+        return SelfDevBuildTarget::Tui;
+    };
+    if !output.status.success() {
+        return SelfDevBuildTarget::Tui;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut desktop = false;
+    let mut other = false;
+    for line in text.lines() {
+        let path = line
+            .get(3..)
+            .unwrap_or(line)
+            .trim()
+            .rsplit_once(" -> ")
+            .map(|(_, new_path)| new_path)
+            .unwrap_or_else(|| line.get(3..).unwrap_or(line).trim());
+        if path == "Cargo.toml" || path == "Cargo.lock" || path.starts_with(".cargo/") {
+            desktop = true;
+            other = true;
+        } else if path.starts_with("crates/jcode-desktop/") {
+            desktop = true;
+        } else if !path.is_empty() {
+            other = true;
+        }
+    }
+    match (desktop, other) {
+        (true, false) => SelfDevBuildTarget::Desktop,
+        (false, true) => SelfDevBuildTarget::Tui,
+        (true, true) => SelfDevBuildTarget::All,
+        (false, false) => SelfDevBuildTarget::Tui,
+    }
+}
+
+fn shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 pub fn run_selfdev_build(repo_dir: &Path) -> Result<SelfDevBuildCommand> {
@@ -181,23 +253,25 @@ fn home_dir() -> Result<PathBuf> {
         .map_err(|_| anyhow::anyhow!("HOME/USERPROFILE not set"))
 }
 
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Directory for the single launcher path users execute from PATH.
 ///
 /// Defaults to `~/.local/bin` on Unix, `%LOCALAPPDATA%\jcode\bin` on Windows.
 /// Overridable with `JCODE_INSTALL_DIR`.
 pub fn launcher_dir() -> Result<PathBuf> {
-    if let Ok(custom) = std::env::var("JCODE_INSTALL_DIR") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
+    if let Some(custom) = non_empty_env_path("JCODE_INSTALL_DIR") {
+        return Ok(custom);
     }
 
-    if let Ok(sandbox_home) = std::env::var("JCODE_HOME") {
-        let trimmed = sandbox_home.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed).join("bin"));
-        }
+    if let Some(sandbox_home) = non_empty_env_path("JCODE_HOME") {
+        return Ok(sandbox_home.join("bin"));
     }
 
     #[cfg(windows)]
@@ -264,10 +338,8 @@ pub fn update_launcher_symlink_to_stable() -> Result<PathBuf> {
 /// - Then stable channel path
 /// - Finally currently running executable
 pub fn client_update_candidate(is_selfdev_session: bool) -> Option<(PathBuf, &'static str)> {
-    if let Ok(current) = current_binary_path()
-        && current.exists()
-    {
-        return Some((current, "current"));
+    if let Some(current) = existing_binary(current_binary_path(), "current") {
+        return Some(current);
     }
 
     if is_selfdev_session {
@@ -277,23 +349,17 @@ pub fn client_update_candidate(is_selfdev_session: bool) -> Option<(PathBuf, &'s
         {
             return Some((dev, "dev"));
         }
-        if let Ok(canary) = canary_binary_path()
-            && canary.exists()
-        {
-            return Some((canary, "canary"));
+        if let Some(canary) = existing_binary(canary_binary_path(), "canary") {
+            return Some(canary);
         }
     }
 
-    if let Ok(launcher) = launcher_binary_path()
-        && launcher.exists()
-    {
-        return Some((launcher, "launcher"));
+    if let Some(launcher) = existing_binary(launcher_binary_path(), "launcher") {
+        return Some(launcher);
     }
 
-    if let Ok(stable) = stable_binary_path()
-        && stable.exists()
-    {
-        return Some((stable, "stable"));
+    if let Some(stable) = existing_binary(stable_binary_path(), "stable") {
+        return Some(stable);
     }
 
     std::env::current_exe().ok().map(|exe| (exe, "current"))
@@ -308,16 +374,12 @@ pub fn client_update_candidate(is_selfdev_session: bool) -> Option<(PathBuf, &'s
 pub fn shared_server_update_candidate(
     _is_selfdev_session: bool,
 ) -> Option<(PathBuf, &'static str)> {
-    if let Ok(shared_server) = shared_server_binary_path()
-        && shared_server.exists()
-    {
-        return Some((shared_server, "shared-server"));
+    if let Some(shared_server) = existing_binary(shared_server_binary_path(), "shared-server") {
+        return Some(shared_server);
     }
 
-    if let Ok(stable) = stable_binary_path()
-        && stable.exists()
-    {
-        return Some((stable, "stable"));
+    if let Some(stable) = existing_binary(stable_binary_path(), "stable") {
+        return Some(stable);
     }
 
     std::env::current_exe().ok().map(|exe| (exe, "current"))
@@ -343,17 +405,12 @@ pub fn preferred_reload_candidate(is_selfdev_session: bool) -> Option<(PathBuf, 
         }
     });
 
-    let repo_is_newer = |repo: &Path, current: &Path| {
-        let repo_mtime = std::fs::metadata(repo).ok().and_then(|m| m.modified().ok());
-        let current_mtime = std::fs::metadata(current)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        match (repo_mtime, current_mtime) {
+    let repo_is_newer =
+        |repo: &Path, current: &Path| match (binary_mtime(repo), binary_mtime(current)) {
             (Some(repo), Some(current)) => repo > current,
             (Some(_), None) => true,
             _ => false,
-        }
-    };
+        };
 
     match (repo_binary, candidate) {
         (Some((repo, label)), Some((current, _))) if repo_is_newer(&repo, &current) => {

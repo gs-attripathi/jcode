@@ -361,49 +361,7 @@ struct ImageRegion {
     height: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CopyTargetKind {
-    CodeBlock { language: Option<String> },
-    Error,
-    ToolOutput,
-}
-
-impl CopyTargetKind {
-    fn label(&self) -> String {
-        match self {
-            Self::CodeBlock { language } => language
-                .as_deref()
-                .filter(|lang| !lang.is_empty())
-                .unwrap_or("code")
-                .to_string(),
-            Self::Error => "error".to_string(),
-            Self::ToolOutput => "output".to_string(),
-        }
-    }
-
-    fn copied_notice(&self) -> String {
-        match self {
-            Self::CodeBlock { language } => {
-                let label = language
-                    .as_deref()
-                    .filter(|lang| !lang.is_empty())
-                    .unwrap_or("code block");
-                format!("Copied {}", label)
-            }
-            Self::Error => "Copied error".to_string(),
-            Self::ToolOutput => "Copied output".to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct RawCopyTarget {
-    pub(crate) kind: CopyTargetKind,
-    pub(crate) content: String,
-    pub(crate) start_raw_line: usize,
-    pub(crate) end_raw_line: usize,
-    pub(crate) badge_raw_line: usize,
-}
+pub(crate) use jcode_tui_markdown::{CopyTargetKind, RawCopyTarget};
 
 #[derive(Clone, Debug)]
 struct CopyTarget {
@@ -1140,6 +1098,21 @@ static BODY_CACHE: OnceLock<Mutex<BodyCacheState>> = OnceLock::new();
 
 fn body_cache() -> &'static Mutex<BodyCacheState> {
     BODY_CACHE.get_or_init(|| Mutex::new(BodyCacheState::default()))
+}
+
+/// Drop every cached body-render entry. Called when display_messages is
+/// non-incrementally rewritten (clear / replace) — the incremental-base
+/// optimization in `take_best_incremental_base` matches purely on
+/// `msg_count` and layout params, NOT on message identity, so a leftover
+/// entry from a previous display state would be reused as the prefix and
+/// you'd see ghost messages from before the clear (e.g. the "Press Alt+;"
+/// startup hint reappearing in the position of a freshly-typed user
+/// prompt). Wiping the cache forces a fresh render on the next frame.
+pub(crate) fn clear_body_cache() {
+    if let Ok(mut cache) = body_cache().lock() {
+        cache.entries.clear();
+        cache.oversized_entries.clear();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1930,7 +1903,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     }
 
     if let Some(picker_cell) = app.login_picker_overlay() {
-        let picker = picker_cell.borrow();
+        let mut picker = picker_cell.borrow_mut();
         picker.render(frame);
         finalize_frame_metrics(
             app,
@@ -1943,7 +1916,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     }
 
     if let Some(picker_cell) = app.account_picker_overlay() {
-        let picker = picker_cell.borrow();
+        let mut picker = picker_cell.borrow_mut();
         picker.render(frame);
         finalize_frame_metrics(
             app,

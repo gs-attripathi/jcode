@@ -56,6 +56,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/split-view", "Alias for /splitview"),
     RegisteredCommand::public("/btw", "Ask a side question in the side panel"),
     RegisteredCommand::public("/git", "Show git status for the session working directory"),
+    RegisteredCommand::public("/transcript", "Open the current session transcript file"),
     RegisteredCommand::public("/subagent-model", "Show/change subagent model policy"),
     RegisteredCommand::public("/autoreview", "Show/toggle automatic end-of-turn review"),
     RegisteredCommand::public("/autojudge", "Show/toggle automatic end-of-turn judging"),
@@ -64,7 +65,6 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/effort", "Show/change reasoning effort (Alt+left/right)"),
     RegisteredCommand::public("/fast", "Toggle OpenAI/Codex fast mode"),
     RegisteredCommand::public("/transport", "Show/change connection transport"),
-    RegisteredCommand::public("/mode", "Show/change tool permission mode"),
     RegisteredCommand::public("/alignment", "Show/change default text alignment"),
     RegisteredCommand::public("/clear", "Clear conversation history"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
@@ -80,6 +80,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/memory", "Toggle memory feature"),
     RegisteredCommand::public("/goals", "Open goals overview / resume tracked goals"),
     RegisteredCommand::public("/swarm", "Toggle swarm feature"),
+    RegisteredCommand::public("/overnight", "Run a supervised overnight coordinator"),
     RegisteredCommand::public("/context", "Show the full session context snapshot"),
     RegisteredCommand::public("/version", "Show current version"),
     RegisteredCommand::public("/changelog", "Show recent changes in this build"),
@@ -107,7 +108,7 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/login", "Login to a provider"),
     RegisteredCommand::public("/account", "Open the combined account picker"),
     RegisteredCommand::public("/accounts", "Alias for /account"),
-    RegisteredCommand::public("/cache", "Toggle cache TTL between 5min and 1h"),
+    RegisteredCommand::public("/cache", "Show cache stats or set cache TTL"),
     RegisteredCommand::public("/debug-visual", "Toggle visual debug overlay"),
     RegisteredCommand::public("/screenshot-mode", "Toggle screenshot capture mode"),
     RegisteredCommand::public("/screenshot", "Capture a screenshot debug state"),
@@ -611,6 +612,23 @@ impl App {
             return vec![("/git status".into(), "Show branch and working tree status")];
         }
 
+        if prefix.starts_with("/transcript ") {
+            return self.rank_suggestions(
+                input,
+                vec![(
+                    "/transcript path".into(),
+                    "Print transcript path without opening",
+                )],
+            );
+        }
+
+        if prefix_trimmed == "/transcript" {
+            return vec![(
+                "/transcript path".into(),
+                "Print transcript path without opening",
+            )];
+        }
+
         if prefix.starts_with("/effort ") {
             let efforts = ["none", "low", "medium", "high", "xhigh"];
             return self.rank_suggestions(
@@ -673,6 +691,16 @@ impl App {
                     .iter()
                     .map(|mode| (format!("/compact mode {}", mode), *mode)),
             );
+            return self.rank_suggestions(input, suggestions);
+        }
+
+        if prefix.starts_with("/cache ") {
+            let suggestions = vec![
+                ("/cache stats".into(), "Show KV cache stats"),
+                ("/cache status".into(), "Alias for /cache stats"),
+                ("/cache 1h".into(), "Use 1 hour cache TTL"),
+                ("/cache 5m".into(), "Use 5 minute cache TTL"),
+            ];
             return self.rank_suggestions(input, suggestions);
         }
 
@@ -828,6 +856,25 @@ impl App {
             );
         }
 
+        if prefix.starts_with("/overnight ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/overnight 7".into(),
+                        "Start a 7-hour supervised overnight run",
+                    ),
+                    (
+                        "/overnight status".into(),
+                        "Show latest overnight run status",
+                    ),
+                    ("/overnight log".into(), "Show recent overnight events"),
+                    ("/overnight review".into(), "Open the generated review page"),
+                    ("/overnight cancel".into(), "Request overnight cancellation"),
+                ],
+            );
+        }
+
         if prefix.starts_with("/subscription ") {
             return self.rank_suggestions(
                 input,
@@ -850,20 +897,6 @@ impl App {
                     (
                         "/alignment left".into(),
                         "Save left-aligned layout and apply it now",
-                    ),
-                ],
-            );
-        }
-
-        if prefix.starts_with("/mode ") {
-            return self.rank_suggestions(
-                input,
-                vec![
-                    ("/mode status".into(), "Show current permission mode"),
-                    ("/mode ask".into(), "Ask before protected tool actions"),
-                    (
-                        "/mode autopilot".into(),
-                        "Allow every tool call without prompting",
                     ),
                 ],
             );
@@ -1095,6 +1128,7 @@ impl App {
                 | "/?"
                 | "/btw"
                 | "/git"
+                | "/transcript"
                 | "/observe"
                 | "/todos"
                 | "/splitview"
@@ -1104,7 +1138,6 @@ impl App {
                 | "/effort"
                 | "/fast"
                 | "/transport"
-                | "/mode"
                 | "/login"
                 | "/auth"
                 | "/account"

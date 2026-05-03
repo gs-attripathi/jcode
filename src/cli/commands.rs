@@ -10,6 +10,7 @@ use crate::{browser, gateway, memory, storage, tui};
 
 use super::terminal::{cleanup_tui_runtime, init_tui_runtime};
 
+mod provider_setup;
 mod report_info;
 mod restart;
 
@@ -20,6 +21,7 @@ pub(crate) use super::auth_test::{
     AuthTestChoicePlan, AuthTestTarget, ResolvedAuthTestTarget, auth_test_choice_plan,
     auth_test_error_is_retryable, configured_auth_test_targets, resolve_auth_test_targets,
 };
+pub(crate) use provider_setup::{ProviderAddOptions, run_provider_add_command};
 pub use restart::{
     maybe_run_pending_restart_restore_on_startup, run_restart_clear_command,
     run_restart_restore_command, run_restart_save_command, run_restart_status_command,
@@ -996,14 +998,17 @@ pub async fn run_model_command(
 
     if emit_json {
         let report = ModelListReport {
-            provider: provider.name().to_string(),
+            provider: crate::provider_catalog::runtime_provider_display_name(provider.name()),
             selected_model: provider.model(),
             models,
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         if verbose {
-            println!("Provider: {}", provider.name());
+            println!(
+                "Provider: {}",
+                crate::provider_catalog::runtime_provider_display_name(provider.name())
+            );
             println!("Selected model: {}", provider.model());
             println!("Available models: {}", models.len());
             println!();

@@ -591,6 +591,24 @@ fn test_autojudge_command_toggles_session_preference() {
 }
 
 #[test]
+fn test_transcript_path_command_reports_current_session_file() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        let expected = crate::session::session_path(&app.session.id).expect("session path");
+
+        assert!(super::commands::handle_session_command(
+            &mut app,
+            "/transcript path"
+        ));
+
+        assert!(app.display_messages().iter().any(|msg| {
+            msg.content.contains("Transcript file:")
+                && msg.content.contains(&expected.display().to_string())
+        }));
+    });
+}
+
+#[test]
 fn test_poke_arms_auto_poke_until_todos_are_done() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
@@ -826,4 +844,55 @@ fn test_finish_turn_auto_poke_preserves_visible_turn_started() {
         assert_eq!(app.visible_turn_started, Some(started));
         assert!(app.pending_queued_dispatch);
     });
+}
+
+#[test]
+fn test_help_topic_shows_overnight_command_details() {
+    let mut app = create_test_app();
+    app.input = "/help overnight".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("`/overnight <hours>[h|m] [mission]`"));
+    assert!(msg.content.contains("review HTML page"));
+    assert!(msg.content.contains("`/overnight status`"));
+}
+
+#[test]
+fn test_overnight_status_without_runs_is_handled() {
+    with_temp_jcode_home(|| {
+        let mut app = create_test_app();
+        assert!(super::commands::handle_session_command(
+            &mut app,
+            "/overnight status"
+        ));
+
+        let msg = app
+            .display_messages()
+            .last()
+            .expect("missing overnight status response");
+        assert_eq!(msg.role, "system");
+        assert!(msg.content.contains("No overnight runs found"));
+    });
+}
+
+#[test]
+fn test_overnight_help_command_is_handled() {
+    let mut app = create_test_app();
+    assert!(super::commands::handle_session_command(
+        &mut app,
+        "/overnight help"
+    ));
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing overnight help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("`/overnight <hours>[h|m] [mission]`"));
+    assert!(msg.content.contains("`/overnight review`"));
 }

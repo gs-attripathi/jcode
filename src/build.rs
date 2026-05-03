@@ -7,8 +7,8 @@ pub use paths::{
     current_binary_build_time_string, current_binary_built_at, find_dev_binary,
     find_repo_in_ancestors, get_repo_dir, is_jcode_repo, launcher_binary_path, launcher_dir,
     preferred_reload_candidate, release_binary_path, run_selfdev_build, selfdev_binary_path,
-    selfdev_build_command, shared_server_update_candidate, update_launcher_symlink_to_current,
-    update_launcher_symlink_to_stable,
+    selfdev_build_command, selfdev_build_command_for_target, shared_server_update_candidate,
+    update_launcher_symlink_to_current, update_launcher_symlink_to_stable,
 };
 pub use source_state::{
     current_build_info, current_git_diff, current_git_hash, current_git_hash_full,
@@ -26,117 +26,18 @@ pub use storage_helpers::{
 
 use crate::storage;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SelfDevBuildCommand {
-    pub program: String,
-    pub args: Vec<String>,
-    pub display: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SourceState {
-    pub repo_scope: String,
-    pub worktree_scope: String,
-    pub short_hash: String,
-    pub full_hash: String,
-    pub dirty: bool,
-    pub fingerprint: String,
-    pub version_label: String,
-    pub changed_paths: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PublishedBuild {
-    pub version: String,
-    pub source_fingerprint: String,
-    pub versioned_path: PathBuf,
-    pub current_link: PathBuf,
-    pub launcher_link: PathBuf,
-    pub previous_current_version: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PendingActivation {
-    pub session_id: String,
-    pub new_version: String,
-    pub previous_current_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_shared_server_version: Option<String>,
-    pub source_fingerprint: Option<String>,
-    pub requested_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DevBinarySourceMetadata {
-    pub version_label: String,
-    pub source_fingerprint: String,
-    pub short_hash: String,
-    pub full_hash: String,
-    pub dirty: bool,
-    pub changed_paths: usize,
-}
-
-impl From<&SourceState> for DevBinarySourceMetadata {
-    fn from(source: &SourceState) -> Self {
-        Self {
-            version_label: source.version_label.clone(),
-            source_fingerprint: source.fingerprint.clone(),
-            short_hash: source.short_hash.clone(),
-            full_hash: source.full_hash.clone(),
-            dirty: source.dirty,
-            changed_paths: source.changed_paths,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct BinaryVersionReport {
-    version: Option<String>,
-    git_hash: Option<String>,
-}
-
-/// Status of a canary build being tested
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum CanaryStatus {
-    /// Build is currently being tested
-    #[serde(alias = "Testing")]
-    Testing,
-    /// Build passed all tests and is ready for promotion
-    #[serde(alias = "Passed")]
-    Passed,
-    /// Build failed testing
-    #[serde(alias = "Failed")]
-    Failed,
-}
-
-/// Information about a specific build version
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuildInfo {
-    /// Git commit hash (short)
-    pub hash: String,
-    /// Git commit hash (full)
-    pub full_hash: String,
-    /// Build timestamp
-    pub built_at: DateTime<Utc>,
-    /// Git commit message (first line)
-    pub commit_message: Option<String>,
-    /// Whether build is from dirty working tree
-    pub dirty: bool,
-    /// Stable fingerprint of the source state used to produce the build.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_fingerprint: Option<String>,
-    /// Immutable published version label, if available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version_label: Option<String>,
-}
+pub use jcode_selfdev_types::{
+    BinaryChoice, BinaryVersionReport, BuildInfo, CanaryStatus, CrashInfo, DevBinarySourceMetadata,
+    MigrationContext, PendingActivation, PublishedBuild, SelfDevBuildCommand, SelfDevBuildTarget,
+    SourceState,
+};
 
 /// Manifest tracking build versions and their status
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -158,33 +59,6 @@ pub struct BuildManifest {
     /// Pending activation being validated across reload/resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_activation: Option<PendingActivation>,
-}
-
-/// Information about a crash during canary testing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CrashInfo {
-    /// Build hash that crashed
-    pub build_hash: String,
-    /// Exit code
-    pub exit_code: i32,
-    /// Stderr output (truncated)
-    pub stderr: String,
-    /// Timestamp of crash
-    pub crashed_at: DateTime<Utc>,
-    /// Git diff that was being tested
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diff: Option<String>,
-}
-
-/// Context saved before migrating to a canary build
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MigrationContext {
-    pub session_id: String,
-    pub from_version: String,
-    pub to_version: String,
-    pub change_summary: Option<String>,
-    pub diff: Option<String>,
-    pub timestamp: DateTime<Utc>,
 }
 
 impl BuildManifest {
@@ -323,17 +197,6 @@ pub fn rollback_pending_activation_for_session(session_id: &str) -> Result<Optio
     manifest.pending_activation = None;
     manifest.save()?;
     Ok(Some(pending.new_version))
-}
-
-/// Which binary to use
-#[derive(Debug, Clone)]
-pub enum BinaryChoice {
-    /// Use the stable version
-    Stable(String),
-    /// Use the canary version (for testing)
-    Canary(String),
-    /// Use current running binary (no versioned builds yet)
-    Current,
 }
 
 /// Install a binary at a specific immutable version path.
@@ -696,6 +559,9 @@ pub fn smoke_test_server_binary(binary: &Path) -> Result<()> {
         .env("JCODE_NON_INTERACTIVE", "1")
         .env("JCODE_RUNTIME_DIR", &runtime_dir)
         .env("JCODE_GATEWAY_ENABLED", "0")
+        .env("JCODE_TEMP_SERVER", "1")
+        .env("JCODE_SERVER_OWNER_PID", std::process::id().to_string())
+        .env("JCODE_TEMP_SERVER_IDLE_SECS", "300")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr))

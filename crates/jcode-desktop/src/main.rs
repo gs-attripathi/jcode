@@ -1,5 +1,6 @@
 mod animation;
 mod desktop_prefs;
+mod power_inhibit;
 mod render_helpers;
 mod session_data;
 mod session_launch;
@@ -93,24 +94,35 @@ const STATUS_PREVIEW_EMPTY_FOCUSED_COLOR: [f32; 4] = [0.953, 0.965, 0.984, 0.50]
 const STATUS_PREVIEW_VIEWPORT_COLOR: [f32; 4] = [0.953, 0.965, 0.984, 0.78];
 const WORKSPACE_NUMBER_COLOR: [f32; 4] = [0.953, 0.965, 0.984, 0.90];
 const STATUS_TEXT_COLOR: [f32; 4] = [0.953, 0.965, 0.984, 0.88];
-const PANEL_TITLE_COLOR: [f32; 4] = [0.035, 0.045, 0.065, 0.98];
-const PANEL_BODY_COLOR: [f32; 4] = [0.030, 0.038, 0.056, 0.96];
-const ASSISTANT_TEXT_COLOR: [f32; 4] = [0.015, 0.105, 0.125, 0.98];
-const ASSISTANT_HEADING_TEXT_COLOR: [f32; 4] = [0.045, 0.155, 0.360, 0.99];
-const ASSISTANT_QUOTE_TEXT_COLOR: [f32; 4] = [0.235, 0.115, 0.380, 0.98];
-const ASSISTANT_TABLE_TEXT_COLOR: [f32; 4] = [0.025, 0.200, 0.230, 0.98];
-const ASSISTANT_LINK_TEXT_COLOR: [f32; 4] = [0.015, 0.175, 0.430, 0.99];
-const USER_TEXT_COLOR: [f32; 4] = [0.055, 0.075, 0.285, 0.99];
-const USER_CONTINUATION_TEXT_COLOR: [f32; 4] = [0.065, 0.080, 0.240, 0.96];
-const TOOL_TEXT_COLOR: [f32; 4] = [0.330, 0.180, 0.015, 0.98];
-const META_TEXT_COLOR: [f32; 4] = [0.120, 0.145, 0.190, 0.92];
-const CODE_TEXT_COLOR: [f32; 4] = [0.110, 0.125, 0.160, 0.98];
-const STATUS_TEXT_ACCENT_COLOR: [f32; 4] = [0.090, 0.220, 0.155, 0.98];
-const ERROR_TEXT_COLOR: [f32; 4] = [0.470, 0.040, 0.040, 0.99];
-const OVERLAY_TEXT_COLOR: [f32; 4] = [0.080, 0.105, 0.150, 0.95];
-const OVERLAY_SELECTION_TEXT_COLOR: [f32; 4] = [0.035, 0.065, 0.140, 0.99];
+const PANEL_TITLE_COLOR: [f32; 4] = [0.010, 0.014, 0.025, 1.0];
+const PANEL_BODY_COLOR: [f32; 4] = [0.008, 0.012, 0.020, 1.0];
+const ASSISTANT_TEXT_COLOR: [f32; 4] = [0.000, 0.060, 0.072, 1.0];
+const ASSISTANT_HEADING_TEXT_COLOR: [f32; 4] = [0.012, 0.080, 0.250, 1.0];
+const ASSISTANT_QUOTE_TEXT_COLOR: [f32; 4] = [0.145, 0.055, 0.275, 1.0];
+const ASSISTANT_TABLE_TEXT_COLOR: [f32; 4] = [0.000, 0.120, 0.145, 1.0];
+const ASSISTANT_LINK_TEXT_COLOR: [f32; 4] = [0.000, 0.095, 0.315, 1.0];
+const USER_TEXT_COLOR: [f32; 4] = [0.012, 0.030, 0.180, 1.0];
+const USER_CONTINUATION_TEXT_COLOR: [f32; 4] = [0.018, 0.035, 0.155, 1.0];
+const TOOL_TEXT_COLOR: [f32; 4] = [0.225, 0.105, 0.000, 1.0];
+const META_TEXT_COLOR: [f32; 4] = [0.055, 0.070, 0.105, 1.0];
+const CODE_TEXT_COLOR: [f32; 4] = [0.045, 0.055, 0.080, 1.0];
+const STATUS_TEXT_ACCENT_COLOR: [f32; 4] = [0.030, 0.125, 0.080, 1.0];
+const ERROR_TEXT_COLOR: [f32; 4] = [0.360, 0.000, 0.000, 1.0];
+const OVERLAY_TEXT_COLOR: [f32; 4] = [0.030, 0.045, 0.075, 1.0];
+const OVERLAY_SELECTION_TEXT_COLOR: [f32; 4] = [0.010, 0.035, 0.105, 1.0];
+const USER_PROMPT_ACCENT_COLOR: [f32; 4] = [0.000, 0.105, 0.250, 1.0];
+const USER_PROMPT_NUMBER_COLORS: [[f32; 4]; 6] = [
+    [0.330, 0.045, 0.515, 1.0],
+    [0.000, 0.230, 0.365, 1.0],
+    [0.060, 0.285, 0.110, 1.0],
+    [0.540, 0.190, 0.000, 1.0],
+    [0.030, 0.165, 0.520, 1.0],
+    [0.440, 0.055, 0.180, 1.0],
+];
 const PANEL_SECTION_COLOR: [f32; 4] = [0.045, 0.055, 0.080, 0.95];
 const SELECTION_HIGHLIGHT_COLOR: [f32; 4] = [0.220, 0.420, 0.700, 0.22];
+const STREAMING_SHIMMER_SOFT_COLOR: [f32; 4] = [0.220, 0.520, 0.780, 0.055];
+const STREAMING_SHIMMER_CORE_COLOR: [f32; 4] = [0.220, 0.520, 0.780, 0.115];
 const COMPOSER_CARD_BACKGROUND_COLOR: [f32; 4] = [0.990, 0.995, 1.000, 0.52];
 const COMPOSER_CARD_BORDER_COLOR: [f32; 4] = [0.085, 0.110, 0.160, 0.24];
 const NATIVE_SPINNER_TRACK_COLOR: [f32; 4] = [0.105, 0.135, 0.190, 0.16];
@@ -158,6 +170,10 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{}", desktop_help_text());
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
         println!("{}", desktop_header_version_label());
         return Ok(());
@@ -201,10 +217,13 @@ async fn run() -> Result<()> {
     let mut cursor_position = winit::dpi::PhysicalPosition::new(0.0, 0.0);
     let mut selecting_body = false;
     let mut hot_reloader = DesktopHotReloader::new();
+    let mut power_inhibitor = power_inhibit::PowerInhibitor::new();
     let (session_event_tx, session_event_rx) = mpsc::channel();
 
     event_loop.run(move |event, target| {
-        if app.has_background_work() {
+        let has_background_work = app.has_background_work();
+        power_inhibitor.set_active(has_background_work);
+        if has_background_work {
             target.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + BACKGROUND_POLL_INTERVAL,
             ));
@@ -575,6 +594,26 @@ fn headless_chat_smoke_message(args: &[String]) -> Option<String> {
                     .flatten()
             })
     })
+}
+
+const DESKTOP_HELP_LINES: &[&str] = &[
+    "Jcode Desktop",
+    "",
+    "Usage:",
+    "  jcode-desktop [OPTIONS]",
+    "",
+    "Options:",
+    "  --fullscreen                 Start borderless fullscreen",
+    "  --workspace                  Open the workspace prototype instead of the single-session chat",
+    "  --headless-chat-smoke <MSG>  Run a hidden backend smoke test and print JSON events",
+    "  --headless-chat-smoke=<MSG>  Same as above",
+    "  -V, --version                Print version information",
+    "  -h, --help                   Print this help",
+    "",
+];
+
+fn desktop_help_text() -> String {
+    DESKTOP_HELP_LINES.join("\n")
 }
 
 fn run_headless_chat_smoke(message: String) -> Result<()> {

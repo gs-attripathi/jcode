@@ -38,12 +38,12 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_URL_OAUTH: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
 /// User-Agent for OAuth requests, matching the official Claude Code CLI.
-pub(crate) const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.112 (external, sdk-cli)";
+pub(crate) const CLAUDE_CLI_USER_AGENT: &str = "claude-cli/2.1.123 (external, sdk-cli)";
 
 /// Claude Code billing attribution text observed in the official CLI's system
 /// prompt blocks.
 pub(crate) const OAUTH_BILLING_HEADER: &str =
-    "cc_version=2.1.112.826; cc_entrypoint=sdk-cli; cch=33f85;";
+    "cc_version=2.1.123; cc_entrypoint=sdk-cli; cch=33f85;";
 
 /// Beta headers required for OAuth (tool-enabled Claude Code style)
 pub(crate) const OAUTH_BETA_HEADERS: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24";
@@ -195,6 +195,65 @@ struct OAuthEvalAttributes {
     app_version: String,
 }
 
+async fn oauth_preflight_get(
+    client: &Client,
+    headers: &reqwest::header::HeaderMap,
+    label: &str,
+    url: &str,
+) -> Result<()> {
+    let resp = client
+        .get(url)
+        .headers(headers.clone())
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = crate::util::http_error_body(resp, "HTTP error").await;
+        anyhow::bail!("{} returned {}: {}", label, status, body);
+    }
+
+    Ok(())
+}
+
+async fn oauth_preflight_post_json<T: Serialize + ?Sized>(
+    client: &Client,
+    headers: &reqwest::header::HeaderMap,
+    label: &str,
+    url: &str,
+    body: &T,
+) -> Result<()> {
+    let resp = client
+        .post(url)
+        .headers(headers.clone())
+        .timeout(std::time::Duration::from_secs(5))
+        .json(body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = crate::util::http_error_body(resp, "HTTP error").await;
+        anyhow::bail!("{} returned {}: {}", label, status, body);
+    }
+
+    Ok(())
+}
+
+fn record_oauth_preflight_result(label: &str, result: Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "Claude OAuth preflight {} failed; continuing because Claude Code treats this bootstrap traffic as nonessential: {:#}",
+                label, err
+            ));
+            false
+        }
+    }
+}
+
 async fn ensure_oauth_preflight(
     client: &Client,
     token: &str,
@@ -247,24 +306,37 @@ async fn ensure_oauth_preflight(
         reqwest::header::HeaderValue::from_static("oauth-2025-04-20"),
     );
 
-    client
-        .get("https://api.anthropic.com/api/claude_cli/bootstrap")
-        .headers(headers.clone())
-        .send()
-        .await?
-        .error_for_status()?;
-    client
-        .get("https://api.anthropic.com/api/oauth/account/settings")
-        .headers(headers.clone())
-        .send()
-        .await?
-        .error_for_status()?;
-    client
-        .get("https://api.anthropic.com/api/claude_code_grove")
-        .headers(headers.clone())
-        .send()
-        .await?
-        .error_for_status()?;
+    let mut all_ok = true;
+    all_ok &= record_oauth_preflight_result(
+        "bootstrap",
+        oauth_preflight_get(
+            client,
+            &headers,
+            "bootstrap",
+            "https://api.anthropic.com/api/claude_cli/bootstrap",
+        )
+        .await,
+    );
+    all_ok &= record_oauth_preflight_result(
+        "account settings",
+        oauth_preflight_get(
+            client,
+            &headers,
+            "account settings",
+            "https://api.anthropic.com/api/oauth/account/settings",
+        )
+        .await,
+    );
+    all_ok &= record_oauth_preflight_result(
+        "grove",
+        oauth_preflight_get(
+            client,
+            &headers,
+            "grove",
+            "https://api.anthropic.com/api/claude_code_grove",
+        )
+        .await,
+    );
 
     let eval = OAuthEvalRequest {
         attributes: OAuthEvalAttributes {
@@ -280,22 +352,29 @@ async fn ensure_oauth_preflight(
             rate_limit_tier: "default_claude_ai".to_string(),
             first_token_time: 1_740_976_801_491,
             email: email_address,
-            app_version: "2.1.112".to_string(),
+            app_version: "2.1.123".to_string(),
         },
         forced_variations: Default::default(),
         forced_features: Vec::new(),
         url: String::new(),
     };
 
-    client
-        .post("https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe")
-        .headers(headers)
-        .json(&eval)
-        .send()
-        .await?
-        .error_for_status()?;
+    all_ok &= record_oauth_preflight_result(
+        "eval",
+        oauth_preflight_post_json(
+            client,
+            &headers,
+            "eval",
+            "https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe",
+            &eval,
+        )
+        .await,
+    );
 
     done_flag.store(true, Ordering::Relaxed);
+    if all_ok {
+        crate::logging::info("Claude OAuth preflight completed successfully");
+    }
     Ok(())
 }
 
@@ -459,6 +538,15 @@ impl AnthropicProvider {
         // Load fresh credentials or refresh expired ones
         let fresh_creds =
             auth::claude::load_credentials().context("Failed to load Claude credentials")?;
+
+        if !fresh_creds.scopes.is_empty()
+            && !oauth::claude_scopes_have_inference(&fresh_creds.scopes)
+        {
+            anyhow::bail!(
+                "Claude OAuth credentials are missing the required user:inference scope (scopes: {}). Run `jcode login --provider claude` to mint a fresh Claude.ai OAuth token, or import/use a fresh Claude Code login.",
+                fresh_creds.scopes.join(" ")
+            );
+        }
 
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -1257,9 +1345,13 @@ async fn force_refresh_oauth_token(
 
     let active_label =
         auth::claude::active_account_label().unwrap_or_else(auth::claude::primary_account_label);
-    let refreshed = oauth::refresh_claude_tokens_for_account(&refresh_token, &active_label)
-        .await
-        .context("OAuth refresh endpoint rejected the refresh token")?;
+    let refreshed =
+        match oauth::refresh_claude_tokens_for_account(&refresh_token, &active_label).await {
+            Ok(refreshed) => refreshed,
+            Err(err) => {
+                anyhow::bail!("OAuth refresh endpoint rejected the refresh token: {err:#}");
+            }
+        };
 
     {
         let mut cached = credentials.write().await;
@@ -1458,6 +1550,7 @@ fn is_oauth_auth_error(error_str: &str) -> bool {
         || error_str.contains("authentication_error")
         || error_str.contains("invalid token")
         || error_str.contains("invalid_grant")
+        || error_str.contains("does not meet scope requirement")
         || ((error_str.contains("401 unauthorized") || error_str.contains("403 forbidden"))
             && (error_str.contains("oauth") || error_str.contains("token")))
 }

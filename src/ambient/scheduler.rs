@@ -3,8 +3,7 @@
 //! Tracks per-call token usage (user vs ambient), maintains a rolling usage log,
 //! and computes adaptive intervals for ambient cycles based on rate limit headroom.
 use crate::storage;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{Duration as ChronoDuration, Utc};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,39 +11,7 @@ use std::time::Duration;
 // Usage record types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum UsageSource {
-    User,
-    Ambient,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UsageRecord {
-    pub timestamp: DateTime<Utc>,
-    pub source: UsageSource,
-    pub tokens_input: u32,
-    pub tokens_output: u32,
-    pub provider: String,
-}
-
-impl UsageRecord {
-    pub fn total_tokens(&self) -> u64 {
-        self.tokens_input as u64 + self.tokens_output as u64
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Rate limit info (from provider response headers)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct RateLimitInfo {
-    pub limit_tokens: Option<u64>,
-    pub remaining_tokens: Option<u64>,
-    pub limit_requests: Option<u64>,
-    pub remaining_requests: Option<u64>,
-    pub reset_at: Option<DateTime<Utc>>,
-}
+pub use jcode_ambient_types::{RateLimitInfo, UsageRecord, UsageSource};
 
 // ---------------------------------------------------------------------------
 // Usage log — rolling, persisted to disk

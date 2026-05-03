@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::{LazyLock, RwLock};
 
 static GITHUB_TOKEN_CACHE: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
+const FAILED_VALIDATION_AUTO_USE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn cached_github_token() -> Option<String> {
     GITHUB_TOKEN_CACHE
@@ -144,7 +145,7 @@ impl CopilotApiToken {
 /// 5. ~/.config/github-copilot/hosts.json (legacy Copilot CLI)
 /// 6. ~/.config/github-copilot/apps.json (legacy VS Code)
 /// 7. trusted OpenCode/pi auth.json OAuth entries
-/// 8. gh auth token fallback
+/// 8. optional `gh auth token` fallback when JCODE_COPILOT_ALLOW_GH_AUTH_TOKEN=1
 pub fn load_github_token() -> Result<String> {
     if let Some(token) = cached_github_token() {
         return Ok(token);
@@ -195,16 +196,77 @@ pub fn load_github_token() -> Result<String> {
         return Ok(token);
     }
 
-    if let Some(token) = load_token_from_gh_cli() {
-        cache_github_token(&token);
-        return Ok(token);
+    if allow_gh_cli_fallback() {
+        if let Some(token) = load_token_from_gh_cli() {
+            cache_github_token(&token);
+            return Ok(token);
+        }
     }
 
     anyhow::bail!(
         "GitHub Copilot token not found. \
-         Set COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN, or run `gh auth login` / `gh extension install github/gh-copilot && gh copilot` \
-         to authenticate."
+         Set COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN, run `jcode login --provider copilot`, \
+         or set JCODE_COPILOT_ALLOW_GH_AUTH_TOKEN=1 to explicitly reuse `gh auth token`."
     )
+}
+
+fn allow_gh_cli_fallback() -> bool {
+    std::env::var("JCODE_COPILOT_ALLOW_GH_AUTH_TOKEN")
+        .ok()
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
+fn copilot_env_token_present() -> bool {
+    ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .any(|env_key| {
+            std::env::var(env_key)
+                .ok()
+                .map(|token| !token.trim().is_empty())
+                .unwrap_or(false)
+        })
+}
+
+/// Return true when a recent `auth-test` proved the discovered Copilot token is
+/// not exchangeable for a Copilot API token.
+///
+/// Copilot is unusual because a local GitHub OAuth token can exist while the
+/// account is not entitled to Copilot, or the token is otherwise rejected by the
+/// Copilot token service. Presence-only checks are still useful for explicit
+/// diagnostics, but they must not cause startup/default-provider selection to
+/// silently choose Copilot as a usable provider after a known token-exchange
+/// failure. Environment tokens are treated as an explicit override because they
+/// may be a newly supplied credential that is not represented by the saved
+/// validation record.
+pub fn validation_failure_blocks_auto_use() -> bool {
+    if copilot_env_token_present() {
+        return false;
+    }
+
+    let Some(record) = crate::auth::validation::get("copilot") else {
+        return false;
+    };
+    if record.success {
+        return false;
+    }
+
+    let age_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_sub(record.checked_at_ms);
+    if age_ms > FAILED_VALIDATION_AUTO_USE_TTL_MS {
+        return false;
+    }
+
+    let summary = record.summary.to_ascii_lowercase();
+    summary.contains("copilot token exchange failed")
+        && (summary.contains("http 401")
+            || summary.contains("http 403")
+            || summary.contains("feature_flag_blocked")
+            || summary.contains("resource not accessible"))
 }
 
 /// Check if Copilot credentials are available (without loading the full token)

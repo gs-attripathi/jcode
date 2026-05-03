@@ -174,6 +174,10 @@ fn compact_usage_height(data: &InfoWidgetData) -> u16 {
     0
 }
 
+fn compact_kv_cache_height(data: &InfoWidgetData) -> u16 {
+    if data.cache_hit_info.is_some() { 1 } else { 0 }
+}
+
 fn compact_git_height(data: &InfoWidgetData) -> u16 {
     if let Some(info) = &data.git_info
         && info.is_interesting()
@@ -190,6 +194,7 @@ fn compact_overview_height(data: &InfoWidgetData) -> u16 {
         + compact_memory_height(data)
         + compact_background_height(data)
         + compact_usage_height(data)
+        + compact_kv_cache_height(data)
         + compact_git_height(data)
 }
 

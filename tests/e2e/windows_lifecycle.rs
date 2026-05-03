@@ -61,6 +61,8 @@ impl SpawnedWindowsServer {
             .env("JCODE_OPENAI_COMPAT_DEFAULT_MODEL", "windows-e2e-model")
             .env("JCODE_OPENAI_COMPAT_LOCAL_ENABLED", "1")
             .env("JCODE_DEBUG_CONTROL", "1")
+            .env("JCODE_TEMP_SERVER", "1")
+            .env("JCODE_SERVER_OWNER_PID", std::process::id().to_string())
             .env("RUST_BACKTRACE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout_file))
@@ -95,6 +97,8 @@ impl SpawnedWindowsServer {
             .env("JCODE_OPENAI_COMPAT_DEFAULT_MODEL", "windows-e2e-model")
             .env("JCODE_OPENAI_COMPAT_LOCAL_ENABLED", "1")
             .env("JCODE_DEBUG_CONTROL", "1")
+            .env("JCODE_TEMP_SERVER", "1")
+            .env("JCODE_SERVER_OWNER_PID", std::process::id().to_string())
             .env("RUST_BACKTRACE", "1")
     }
 

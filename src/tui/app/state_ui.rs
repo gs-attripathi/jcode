@@ -577,11 +577,20 @@ impl App {
         }
 
         self.last_side_panel_refresh = Some(now);
-        if crate::side_panel::refresh_linked_page_content(&mut self.side_panel, None) {
-            self.sync_diagram_fit_context();
-            self.prewarm_focused_side_panel();
-            return true;
-        }
+        let mut snapshot = self.side_panel.clone();
+        let session_id = self.active_client_session_id().map(str::to_string);
+        std::thread::spawn(move || {
+            if crate::side_panel::refresh_linked_page_content(&mut snapshot, None)
+                && let Some(session_id) = session_id
+            {
+                crate::bus::Bus::global().publish(crate::bus::BusEvent::SidePanelUpdated(
+                    crate::bus::SidePanelUpdated {
+                        session_id,
+                        snapshot,
+                    },
+                ));
+            }
+        });
 
         false
     }
@@ -780,6 +789,392 @@ impl App {
     }
 }
 
+fn cache_ratio_pct(numerator: u64, denominator: u64) -> u8 {
+    if denominator == 0 {
+        0
+    } else {
+        ((numerator as f32 / denominator as f32) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
+    }
+}
+
+fn opt_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "None".to_string())
+}
+
+fn opt_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "None".to_string())
+}
+
+fn opt_string(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("`{}`", value))
+        .unwrap_or_else(|| "None".to_string())
+}
+
+fn push_cache_signature(
+    lines: &mut Vec<String>,
+    label: &str,
+    signature: Option<&KvCacheRequestSignature>,
+) {
+    if let Some(signature) = signature {
+        lines.push(format!(
+            "- {}.system_static_hash: `{:016x}`",
+            label, signature.system_static_hash
+        ));
+        lines.push(format!(
+            "- {}.tools_hash: `{:016x}`",
+            label, signature.tools_hash
+        ));
+        lines.push(format!(
+            "- {}.messages_hash: `{:016x}`",
+            label, signature.messages_hash
+        ));
+        lines.push(format!(
+            "- {}.message_count: **{}**",
+            label, signature.message_count
+        ));
+        lines.push(format!(
+            "- {}.tool_count: **{}**",
+            label, signature.tool_count
+        ));
+    } else {
+        lines.push(format!("- {}: None", label));
+    }
+}
+
+fn push_cache_baseline(lines: &mut Vec<String>, label: &str, baseline: Option<&KvCacheBaseline>) {
+    if let Some(baseline) = baseline {
+        lines.push(format!(
+            "- {}.input_tokens: **{}**",
+            label, baseline.input_tokens
+        ));
+        lines.push(format!(
+            "- {}.age_secs: **{}**",
+            label,
+            baseline.completed_at.elapsed().as_secs()
+        ));
+        lines.push(format!("- {}.provider: `{}`", label, baseline.provider));
+        lines.push(format!("- {}.model: `{}`", label, baseline.model));
+        lines.push(format!(
+            "- {}.upstream_provider: {}",
+            label,
+            opt_string(baseline.upstream_provider.as_deref())
+        ));
+        push_cache_signature(
+            lines,
+            &format!("{}.signature", label),
+            baseline.signature.as_ref(),
+        );
+    } else {
+        lines.push(format!("- {}: None", label));
+    }
+}
+
+fn format_cache_stats(app: &App) -> String {
+    let reported = app.total_cache_reported_input_tokens;
+    let read = app.total_cache_read_tokens;
+    let write = app.total_cache_creation_tokens;
+    let optimal = app.total_cache_optimal_input_tokens;
+    let read_pct = cache_ratio_pct(read, reported);
+    let write_pct = cache_ratio_pct(write, reported);
+    let optimal_pct = (optimal > 0).then(|| cache_ratio_pct(read, optimal));
+    let ttl = if crate::provider::anthropic::is_cache_ttl_1h() {
+        "1 hour"
+    } else {
+        "5 minutes"
+    };
+    let current_provider = if app.is_remote {
+        app.remote_provider_name
+            .clone()
+            .unwrap_or_else(|| app.provider.name().to_string())
+    } else {
+        app.provider.name().to_string()
+    };
+    let current_model = if app.is_remote {
+        app.remote_provider_model
+            .clone()
+            .unwrap_or_else(|| app.provider.model())
+    } else {
+        app.provider.model()
+    };
+
+    let persisted_usage = app
+        .session
+        .messages
+        .iter()
+        .filter_map(|message| message.token_usage.as_ref())
+        .fold((0_u64, 0_u64, 0_u64, 0_u64, 0_usize), |acc, usage| {
+            (
+                acc.0.saturating_add(usage.input_tokens),
+                acc.1.saturating_add(usage.output_tokens),
+                acc.2
+                    .saturating_add(usage.cache_read_input_tokens.unwrap_or(0)),
+                acc.3
+                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0)),
+                acc.4.saturating_add(1),
+            )
+        });
+
+    let mut lines = Vec::new();
+    lines.push("**KV cache stats**".to_string());
+    lines.push(String::new());
+    lines.push("Raw session/cache diagnostic state for this client. Cache telemetry is provider-reported when available.".to_string());
+    lines.push(String::new());
+
+    lines.push("**Current route / settings**".to_string());
+    lines.push(format!("- cache_ttl_setting: **{}**", ttl));
+    lines.push(format!("- is_remote: **{}**", app.is_remote));
+    lines.push(format!("- is_replay: **{}**", app.is_replay));
+    lines.push(format!("- current_provider: `{}`", current_provider));
+    lines.push(format!("- current_model: `{}`", current_model));
+    lines.push(format!(
+        "- upstream_provider: {}",
+        opt_string(app.upstream_provider.as_deref())
+    ));
+    lines.push(format!(
+        "- connection_type: {}",
+        opt_string(app.connection_type.as_deref())
+    ));
+    lines.push(format!(
+        "- status_detail: {}",
+        opt_string(app.status_detail.as_deref())
+    ));
+    lines.push(String::new());
+
+    lines.push("**Session token totals (raw counters)**".to_string());
+    lines.push(format!(
+        "- total_input_tokens: **{}**",
+        app.total_input_tokens
+    ));
+    lines.push(format!(
+        "- total_output_tokens: **{}**",
+        app.total_output_tokens
+    ));
+    lines.push(format!("- total_cost_usd: **{:.6}**", app.total_cost));
+    lines.push(format!(
+        "- cached_prompt_price_per_1m: {}",
+        app.cached_prompt_price
+            .map(|price| format!("{:.6}", price))
+            .unwrap_or_else(|| "None".to_string())
+    ));
+    lines.push(format!(
+        "- cached_completion_price_per_1m: {}",
+        app.cached_completion_price
+            .map(|price| format!("{:.6}", price))
+            .unwrap_or_else(|| "None".to_string())
+    ));
+    lines.push(format!("- context_limit: **{}**", app.context_limit));
+    lines.push(format!(
+        "- last_turn_input_tokens: {}",
+        opt_u64(app.last_turn_input_tokens)
+    ));
+    lines.push(format!(
+        "- last_api_completed_age_secs: {}",
+        app.last_api_completed
+            .map(|instant| instant.elapsed().as_secs().to_string())
+            .unwrap_or_else(|| "None".to_string())
+    ));
+    lines.push(format!(
+        "- last_api_completed_provider: {}",
+        opt_string(app.last_api_completed_provider.as_deref())
+    ));
+    lines.push(format!(
+        "- last_api_completed_model: {}",
+        opt_string(app.last_api_completed_model.as_deref())
+    ));
+    lines.push(String::new());
+
+    lines.push("**Provider cache telemetry totals**".to_string());
+    lines.push(format!(
+        "- total_cache_reported_input_tokens: **{}**",
+        reported
+    ));
+    lines.push(format!("- total_cache_read_tokens: **{}**", read));
+    lines.push(format!("- total_cache_creation_tokens: **{}**", write));
+    lines.push(format!(
+        "- total_cache_optimal_input_tokens: **{}**",
+        optimal
+    ));
+    lines.push(format!(
+        "- cache_read_pct_of_reported_input: **{}%**",
+        read_pct
+    ));
+    lines.push(format!(
+        "- cache_write_pct_of_reported_input: **{}%**",
+        write_pct
+    ));
+    lines.push(format!(
+        "- cache_read_pct_of_optimal_input: {}",
+        optimal_pct
+            .map(|pct| format!("{}%", pct))
+            .unwrap_or_else(|| "None".to_string())
+    ));
+    lines.push(format!(
+        "- last_cache_reported_input_tokens: {}",
+        opt_u64(app.last_cache_reported_input_tokens)
+    ));
+    lines.push(format!(
+        "- last_cache_read_tokens: {}",
+        opt_u64(app.last_cache_read_tokens)
+    ));
+    lines.push(format!(
+        "- last_cache_optimal_input_tokens: {}",
+        opt_u64(app.last_cache_optimal_input_tokens)
+    ));
+    lines.push(format!(
+        "- cache_next_optimal_input_tokens: {}",
+        opt_u64(app.cache_next_optimal_input_tokens)
+    ));
+    lines.push(String::new());
+
+    lines.push("**Current / live stream counters**".to_string());
+    lines.push(format!(
+        "- streaming_input_tokens: **{}**",
+        app.streaming_input_tokens
+    ));
+    lines.push(format!(
+        "- streaming_output_tokens: **{}**",
+        app.streaming_output_tokens
+    ));
+    lines.push(format!(
+        "- streaming_total_output_tokens: **{}**",
+        app.streaming_total_output_tokens
+    ));
+    lines.push(format!(
+        "- streaming_cache_read_tokens: {}",
+        opt_u64(app.streaming_cache_read_tokens)
+    ));
+    lines.push(format!(
+        "- streaming_cache_creation_tokens: {}",
+        opt_u64(app.streaming_cache_creation_tokens)
+    ));
+    lines.push(format!("- status: `{:?}`", app.status));
+    lines.push(format!("- is_processing: **{}**", app.is_processing));
+    lines.push(format!(
+        "- processing_started_age_secs: {}",
+        app.processing_started
+            .map(|instant| instant.elapsed().as_secs().to_string())
+            .unwrap_or_else(|| "None".to_string())
+    ));
+    lines.push(format!(
+        "- last_stream_activity_age_secs: {}",
+        app.last_stream_activity
+            .map(|instant| instant.elapsed().as_secs().to_string())
+            .unwrap_or_else(|| "None".to_string())
+    ));
+    lines.push(format!(
+        "- stream_message_ended: **{}**",
+        app.stream_message_ended
+    ));
+    lines.push(format!(
+        "- streaming_tool_calls_len: **{}**",
+        app.streaming_tool_calls.len()
+    ));
+    lines.push(String::new());
+
+    lines.push("**KV cache tracker state**".to_string());
+    lines.push(format!(
+        "- kv_cache_turn_number: {}",
+        opt_usize(app.kv_cache_turn_number)
+    ));
+    lines.push(format!(
+        "- kv_cache_turn_call_index: **{}**",
+        app.kv_cache_turn_call_index
+    ));
+    lines.push(format!(
+        "- kv_cache_miss_samples_len: **{}**",
+        app.kv_cache_miss_samples.len()
+    ));
+    push_cache_baseline(&mut lines, "baseline", app.kv_cache_baseline.as_ref());
+    if let Some(request) = app.pending_kv_cache_request.as_ref() {
+        lines.push("- pending_request: present".to_string());
+        lines.push(format!(
+            "- pending_request.turn_number: **{}**",
+            request.turn_number
+        ));
+        lines.push(format!(
+            "- pending_request.call_index: **{}**",
+            request.call_index
+        ));
+        lines.push(format!(
+            "- pending_request.provider: `{}`",
+            request.provider
+        ));
+        lines.push(format!("- pending_request.model: `{}`", request.model));
+        lines.push(format!(
+            "- pending_request.upstream_provider: {}",
+            opt_string(request.upstream_provider.as_deref())
+        ));
+        lines.push(format!(
+            "- pending_request.baseline_messages_prefix_matches: **{:?}**",
+            request.baseline_messages_prefix_matches
+        ));
+        push_cache_signature(
+            &mut lines,
+            "pending_request.signature",
+            request.signature.as_ref(),
+        );
+        push_cache_baseline(
+            &mut lines,
+            "pending_request.baseline",
+            request.baseline.as_ref(),
+        );
+    } else {
+        lines.push("- pending_request: None".to_string());
+    }
+    lines.push(String::new());
+
+    lines.push("**Persisted transcript token usage**".to_string());
+    lines.push(format!(
+        "- session.messages_len: **{}**",
+        app.session.messages.len()
+    ));
+    lines.push(format!(
+        "- messages_with_token_usage: **{}**",
+        persisted_usage.4
+    ));
+    lines.push(format!(
+        "- persisted_input_tokens: **{}**",
+        persisted_usage.0
+    ));
+    lines.push(format!(
+        "- persisted_output_tokens: **{}**",
+        persisted_usage.1
+    ));
+    lines.push(format!(
+        "- persisted_cache_read_input_tokens: **{}**",
+        persisted_usage.2
+    ));
+    lines.push(format!(
+        "- persisted_cache_creation_input_tokens: **{}**",
+        persisted_usage.3
+    ));
+    lines.push(String::new());
+
+    lines.push("**Recent miss attributions**".to_string());
+    if app.kv_cache_miss_samples.is_empty() {
+        lines.push("- none attributed".to_string());
+    } else {
+        for sample in app.kv_cache_miss_samples.iter().rev() {
+            lines.push(format!(
+                "- turn={} call={} missed_tokens={} reason=`{}`",
+                sample.turn_number,
+                sample.call_index,
+                sample.missed_tokens,
+                sample.reason.label()
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
 pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed == "/version" {
         let version = env!("JCODE_VERSION");
@@ -807,6 +1202,17 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
     if trimmed == "/cache" || trimmed.starts_with("/cache ") {
         let arg = trimmed.strip_prefix("/cache").unwrap_or("").trim();
         match arg {
+            "stats" | "status" => {
+                app.push_display_message(DisplayMessage {
+                    role: "usage".to_string(),
+                    content: format_cache_stats(app),
+                    tool_calls: vec![],
+                    duration_secs: None,
+                    title: Some("KV cache stats".to_string()),
+                    tool_data: None,
+                });
+                app.set_status_notice("Cache stats");
+            }
             "1h" | "1hour" | "extended" => {
                 crate::provider::anthropic::set_cache_ttl_1h(true);
                 app.push_display_message(DisplayMessage::system(
@@ -832,7 +1238,7 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
             }
             _ => {
                 app.push_display_message(DisplayMessage::error(
-                    "Usage: `/cache` (toggle), `/cache 1h` (1 hour), `/cache 5m` (default)"
+                    "Usage: `/cache` (toggle), `/cache stats`, `/cache 1h` (1 hour), `/cache 5m` (default)"
                         .to_string(),
                 ));
             }
@@ -870,6 +1276,11 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
 
         let mut info = String::new();
         info.push_str(&format!("**Version:** {}\n", version));
+        // In remote mode `app.session.id` is the TUI's local placeholder
+        // (it picks its own animal name); the actual server-side session id
+        // is in `remote_session_id`. Show whichever is authoritative for
+        // this connection so the user sees the real id (the one in
+        // `~/.jcode/sessions/<id>.json`) and can grep for it.
         let session_id_for_info = app
             .active_client_session_id()
             .unwrap_or(app.session.id.as_str());
@@ -1099,9 +1510,9 @@ pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
             context.tool_definition_tokens(),
         ));
         context_report.push_str(&format!(
-            "- system prompt: {} chars\n- env context: {} chars\n- project AGENTS.md: {} ({})\n- global ~/.AGENTS.md: {} ({})\n- prompt overlays: {} chars\n- skills section: {} chars\n- self-dev section: {} chars\n- memory section: {} chars\n- tool definitions: {} chars across {} tools\n- user messages: {} chars across {} messages\n- assistant messages: {} chars across {} messages\n- tool calls: {} chars across {} calls\n- tool results: {} chars across {} results\n",
+            "- system prompt: {} chars\n- session context: {} chars\n- project AGENTS.md: {} ({})\n- global ~/.AGENTS.md: {} ({})\n- prompt overlays: {} chars\n- skills section: {} chars\n- self-dev section: {} chars\n- memory section: {} chars\n- tool definitions: {} chars across {} tools\n- user messages: {} chars across {} messages\n- assistant messages: {} chars across {} messages\n- tool calls: {} chars across {} calls\n- tool results: {} chars across {} results\n",
             context.system_prompt_chars,
-            context.env_context_chars,
+            context.session_context_chars,
             if context.has_project_agents_md { "loaded" } else { "not loaded" },
             context.project_agents_md_chars,
             if context.has_global_agents_md { "loaded" } else { "not loaded" },

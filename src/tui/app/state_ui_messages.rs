@@ -10,11 +10,30 @@ const COMPACTED_HISTORY_MARKER_PREFIX: &str = "Earlier conversation compacted â€
 impl App {
     pub fn push_display_message(&mut self, mut message: DisplayMessage) {
         compact_display_message_tool_data(&mut message);
+        let preview: String = message
+            .content
+            .chars()
+            .take(40)
+            .collect::<String>()
+            .replace('\n', " ");
         if self.try_coalesce_repeated_display_message(&message) {
+            crate::logging::info(&format!(
+                "display_msg push COALESCED: role={} preview=\"{}\" len={}",
+                message.role,
+                preview,
+                self.display_messages.len(),
+            ));
             return;
         }
         let is_tool = message.role == "tool";
+        let role = message.role.clone();
         self.display_messages.push(message);
+        crate::logging::info(&format!(
+            "display_msg push: role={} preview=\"{}\" new_len={}",
+            role,
+            preview,
+            self.display_messages.len(),
+        ));
         self.bump_display_messages_version();
         if is_tool && self.diff_mode.has_side_pane() && self.diff_pane_auto_scroll {
             self.diff_pane_scroll = usize::MAX;
@@ -23,7 +42,17 @@ impl App {
 
     pub(super) fn replace_display_messages(&mut self, mut messages: Vec<DisplayMessage>) {
         compact_display_messages_for_storage(&mut messages);
+        crate::logging::info(&format!(
+            "display_msg REPLACE: old_len={} new_len={}",
+            self.display_messages.len(),
+            messages.len(),
+        ));
         self.display_messages = messages;
+        // Body cache holds rendered prefixes keyed by msg_count + layout
+        // params (no message-identity check). Wholesale replacement makes
+        // those prefixes stale even though their key still matches â€”
+        // wipe the cache so the next frame re-renders from scratch.
+        crate::tui::clear_body_cache();
         self.sync_compacted_history_lazy_from_display_messages();
         self.bump_display_messages_version();
         self.note_runtime_memory_event_force("display_messages_replaced", "display_history_reset");
@@ -208,7 +237,15 @@ impl App {
     pub(super) fn clear_display_messages(&mut self) {
         self.compacted_history_lazy = CompactedHistoryLazyState::default();
         if !self.display_messages.is_empty() {
+            crate::logging::info(&format!(
+                "display_msg CLEAR: was_len={}",
+                self.display_messages.len()
+            ));
             self.display_messages.clear();
+            // Same reason as replace_display_messages: drop cached
+            // prefixes that would otherwise be reused as a stale base
+            // for the rebuilt display.
+            crate::tui::clear_body_cache();
             self.bump_display_messages_version();
         }
     }

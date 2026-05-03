@@ -9,11 +9,11 @@ use crate::config::config;
 use crate::id;
 use crate::mcp::McpManager;
 use crate::message::{
-    ContentBlock, Message, Role, StreamEvent, TOOL_OUTPUT_MISSING_TEXT, ToolCall,
+    ContentBlock, Message, Role, StreamEvent, TOOL_OUTPUT_MISSING_TEXT, ToolCall, ToolDefinition,
 };
 use crate::provider::Provider;
 use crate::runtime_memory_log::RuntimeMemoryLogController;
-use crate::session::Session;
+use crate::session::{Session, StoredMessage};
 use crate::skill::SkillRegistry;
 use crate::tool::selfdev::ReloadContext;
 use crate::tool::{Registry, ToolContext};
@@ -29,6 +29,7 @@ use helpers::*;
 use ratatui::DefaultTerminal;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -41,6 +42,7 @@ mod auth_account_picker_saved_accounts;
 mod catchup;
 mod commands;
 mod commands_improve;
+mod commands_overnight;
 mod commands_review;
 mod conversation_state;
 mod copy_selection;
@@ -101,6 +103,91 @@ struct PendingSplitPrompt {
 
 struct PendingLocalTransfer {
     receiver: mpsc::Receiver<anyhow::Result<PreparedTransferSession>>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalRewindUndoSnapshot {
+    messages: Vec<StoredMessage>,
+    provider_session_id: Option<String>,
+    session_provider_session_id: Option<String>,
+    visible_message_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRemoteRewindNotice {
+    undo: bool,
+    message_index: Option<usize>,
+    changed_messages: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KvCacheRequestSignature {
+    system_static_hash: u64,
+    tools_hash: u64,
+    messages_hash: u64,
+    message_count: usize,
+    tool_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct KvCacheBaseline {
+    input_tokens: u64,
+    completed_at: Instant,
+    provider: String,
+    model: String,
+    upstream_provider: Option<String>,
+    signature: Option<KvCacheRequestSignature>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingKvCacheRequest {
+    turn_number: usize,
+    call_index: u16,
+    provider: String,
+    model: String,
+    upstream_provider: Option<String>,
+    signature: Option<KvCacheRequestSignature>,
+    baseline_messages_prefix_matches: Option<bool>,
+    baseline: Option<KvCacheBaseline>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvCacheMissReason {
+    ProviderSwitch,
+    ModelSwitch,
+    UpstreamSwitch,
+    Expired,
+    HarnessSystemChanged,
+    HarnessToolsChanged,
+    HarnessPrefixChanged,
+    ZeroRead,
+    LowRead,
+    Unknown,
+}
+
+impl KvCacheMissReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ProviderSwitch => "provider switch",
+            Self::ModelSwitch => "model switch",
+            Self::UpstreamSwitch => "upstream switch",
+            Self::Expired => "expired",
+            Self::HarnessSystemChanged => "harness: system changed",
+            Self::HarnessToolsChanged => "harness: tools changed",
+            Self::HarnessPrefixChanged => "harness: prefix changed",
+            Self::ZeroRead => "zero read",
+            Self::LowRead => "low read",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KvCacheMissSample {
+    turn_number: usize,
+    call_index: u16,
+    missed_tokens: u64,
+    reason: KvCacheMissReason,
 }
 
 struct PendingSessionPickerLoad {
@@ -279,21 +366,17 @@ pub struct CopyBadgeFeedback {
 }
 
 impl CopyBadgeUiState {
+    fn pulse_active(expires_at: Option<Instant>, now: Instant) -> bool {
+        expires_at.is_some_and(|expires_at| expires_at > now)
+    }
+
     pub(crate) fn alt_is_active(&self, now: Instant) -> bool {
-        self.alt_active
-            || self
-                .alt_pulse_until
-                .map(|expires_at| expires_at > now)
-                .unwrap_or(false)
+        self.alt_active || Self::pulse_active(self.alt_pulse_until, now)
     }
 
     pub(crate) fn shift_is_active(&self, now: Instant) -> bool {
         self.alt_is_active(now)
-            && (self.shift_active
-                || self
-                    .shift_pulse_until
-                    .map(|expires_at| expires_at > now)
-                    .unwrap_or(false))
+            && (self.shift_active || Self::pulse_active(self.shift_pulse_until, now))
     }
 
     pub(crate) fn key_is_active(&self, key: char, now: Instant) -> bool {
@@ -426,6 +509,20 @@ pub struct App {
     // Total session token usage (accumulated across all turns)
     total_input_tokens: u64,
     total_output_tokens: u64,
+    // Total session KV cache usage for turns where the provider reported cache telemetry.
+    total_cache_reported_input_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
+    total_cache_optimal_input_tokens: u64,
+    last_cache_reported_input_tokens: Option<u64>,
+    last_cache_read_tokens: Option<u64>,
+    last_cache_optimal_input_tokens: Option<u64>,
+    cache_next_optimal_input_tokens: Option<u64>,
+    kv_cache_baseline: Option<KvCacheBaseline>,
+    pending_kv_cache_request: Option<PendingKvCacheRequest>,
+    kv_cache_turn_number: Option<usize>,
+    kv_cache_turn_call_index: u16,
+    kv_cache_miss_samples: Vec<KvCacheMissSample>,
     // Total cost in USD (for API-key providers)
     total_cost: f32,
     // Cached pricing (input $/1M tokens, output $/1M tokens)
@@ -497,6 +594,8 @@ pub struct App {
     streaming_tool_calls: Vec<ToolCall>,
     // Provider-specific session ID for conversation resume
     provider_session_id: Option<String>,
+    // One-step undo snapshot captured before the most recent local rewind.
+    rewind_undo_snapshot: Option<LocalRewindUndoSnapshot>,
     // Cancel flag for interrupting generation
     cancel_requested: bool,
     // Quit confirmation: tracks when first Ctrl+C was pressed
@@ -580,6 +679,8 @@ pub struct App {
     current_message_id: Option<u64>,
     // Whether running in remote mode
     is_remote: bool,
+    // Remote rewind/undo request waiting for the server's replacement History payload.
+    pending_remote_rewind_notice: Option<PendingRemoteRewindNotice>,
     // Server was just spawned - allow initial connection retries in run_remote
     server_spawning: bool,
     // Whether running in replay mode (readonly playback of a saved session)
@@ -734,6 +835,10 @@ pub struct App {
     input_undo_stack: Vec<(String, usize)>,
     // Short-lived notice for status feedback (model switch, cycle diff mode, etc.)
     status_notice: Option<(String, Instant)>,
+    // Experimental feature warnings already shown in this session.
+    experimental_feature_warnings_seen: HashSet<String>,
+    // Active first-use experimental warning for the currently running tool.
+    active_experimental_feature_notice: Option<String>,
     // Message to interleave during processing (set via Ctrl+Enter in queue mode)
     interleave_message: Option<String>,
     // Message sent as soft interrupt but not yet injected (shown in queue preview until injected)
@@ -862,6 +967,399 @@ impl App {
     const AUTO_RETRY_MAX_ATTEMPTS: u8 = 3;
     const INPUT_UNDO_LIMIT: usize = 128;
     const CLIENT_FOCUS_RECORD_DEBOUNCE: Duration = Duration::from_secs(2);
+    const KV_CACHE_OPTIMAL_OK_PCT: u8 = 85;
+    const KV_CACHE_MIN_MISSED_TOKENS: u64 = 1_024;
+    const KV_CACHE_MAX_MISS_SAMPLES: usize = 12;
+
+    pub(super) fn begin_kv_cache_request(
+        &mut self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system_static: &str,
+    ) {
+        let turn_number = self
+            .display_messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .count()
+            .max(1);
+        if self.kv_cache_turn_number == Some(turn_number) {
+            self.kv_cache_turn_call_index = self.kv_cache_turn_call_index.saturating_add(1).max(1);
+        } else {
+            self.kv_cache_turn_number = Some(turn_number);
+            self.kv_cache_turn_call_index = 1;
+        }
+
+        let baseline = self.kv_cache_baseline.clone();
+        let signature = Self::kv_cache_request_signature(messages, tools, system_static);
+        let baseline_messages_prefix_matches = baseline
+            .as_ref()
+            .and_then(|baseline| baseline.signature.as_ref())
+            .map(|previous| Self::kv_cache_messages_prefix_matches(messages, previous));
+
+        self.pending_kv_cache_request = Some(PendingKvCacheRequest {
+            turn_number,
+            call_index: self.kv_cache_turn_call_index,
+            provider: self.kv_cache_provider_name(),
+            model: self.kv_cache_provider_model(),
+            upstream_provider: self.upstream_provider.clone(),
+            signature: Some(signature),
+            baseline_messages_prefix_matches,
+            baseline,
+        });
+    }
+
+    pub(super) fn record_completed_stream_cache_usage(&mut self) {
+        let has_cache_telemetry = self.streaming_cache_read_tokens.is_some()
+            || self.streaming_cache_creation_tokens.is_some();
+        if self.streaming_input_tokens == 0 {
+            return;
+        }
+
+        let optimal_input_tokens = self.cache_next_optimal_input_tokens;
+        self.cache_next_optimal_input_tokens = Some(self.streaming_input_tokens);
+
+        let request = self
+            .pending_kv_cache_request
+            .take()
+            .unwrap_or_else(|| self.fallback_pending_kv_cache_request());
+
+        self.record_kv_cache_miss_sample(&request);
+
+        if !has_cache_telemetry {
+            self.kv_cache_baseline = Some(KvCacheBaseline {
+                input_tokens: self.streaming_input_tokens,
+                completed_at: Instant::now(),
+                provider: request.provider,
+                model: request.model,
+                upstream_provider: request.upstream_provider,
+                signature: request.signature,
+            });
+            return;
+        }
+
+        self.total_cache_reported_input_tokens = self
+            .total_cache_reported_input_tokens
+            .saturating_add(self.streaming_input_tokens);
+        if let Some(optimal) = optimal_input_tokens {
+            self.total_cache_optimal_input_tokens = self
+                .total_cache_optimal_input_tokens
+                .saturating_add(optimal);
+        }
+        self.total_cache_read_tokens = self
+            .total_cache_read_tokens
+            .saturating_add(self.streaming_cache_read_tokens.unwrap_or(0));
+        self.total_cache_creation_tokens = self
+            .total_cache_creation_tokens
+            .saturating_add(self.streaming_cache_creation_tokens.unwrap_or(0));
+        self.last_cache_reported_input_tokens = Some(self.streaming_input_tokens);
+        self.last_cache_read_tokens = Some(self.streaming_cache_read_tokens.unwrap_or(0));
+        self.last_cache_optimal_input_tokens = optimal_input_tokens;
+
+        self.log_kv_cache_usage_summary(&request, optimal_input_tokens);
+
+        self.kv_cache_baseline = Some(KvCacheBaseline {
+            input_tokens: self.streaming_input_tokens,
+            completed_at: Instant::now(),
+            provider: request.provider,
+            model: request.model,
+            upstream_provider: request.upstream_provider,
+            signature: request.signature,
+        });
+    }
+
+    fn log_kv_cache_usage_summary(
+        &self,
+        request: &PendingKvCacheRequest,
+        optimal_input_tokens: Option<u64>,
+    ) {
+        let input_tokens = self.streaming_input_tokens;
+        let read_tokens = self.streaming_cache_read_tokens.unwrap_or(0);
+        let creation_tokens = self.streaming_cache_creation_tokens.unwrap_or(0);
+        let read_pct = ratio_pct(read_tokens, input_tokens);
+        let creation_pct = ratio_pct(creation_tokens, input_tokens);
+        let optimal_read_pct = optimal_input_tokens.map(|optimal| ratio_pct(read_tokens, optimal));
+        let session_read_pct = ratio_pct(
+            self.total_cache_read_tokens,
+            self.total_cache_reported_input_tokens,
+        );
+        let session_optimal_read_pct = if self.total_cache_optimal_input_tokens > 0 {
+            Some(ratio_pct(
+                self.total_cache_read_tokens,
+                self.total_cache_optimal_input_tokens,
+            ))
+        } else {
+            None
+        };
+        let miss = self
+            .kv_cache_miss_samples
+            .last()
+            .filter(|sample| {
+                sample.turn_number == request.turn_number && sample.call_index == request.call_index
+            })
+            .map(|sample| {
+                format!(
+                    "{}:{}",
+                    sample.missed_tokens,
+                    sample.reason.label().replace(' ', "_")
+                )
+            })
+            .unwrap_or_else(|| {
+                if request.baseline.is_none() {
+                    "warmup:no_baseline".to_string()
+                } else {
+                    "none".to_string()
+                }
+            });
+        let baseline_age_secs = request
+            .baseline
+            .as_ref()
+            .map(|baseline| baseline.completed_at.elapsed().as_secs());
+        let baseline_input_tokens = request
+            .baseline
+            .as_ref()
+            .map(|baseline| baseline.input_tokens);
+        let current_signature = request.signature.as_ref();
+        let baseline_signature = request
+            .baseline
+            .as_ref()
+            .and_then(|baseline| baseline.signature.as_ref());
+        let system_static_hash_changed = current_signature
+            .zip(baseline_signature)
+            .map(|(current, baseline)| current.system_static_hash != baseline.system_static_hash);
+        let tools_hash_changed = current_signature
+            .zip(baseline_signature)
+            .map(|(current, baseline)| current.tools_hash != baseline.tools_hash);
+        let message_prefix_hash_changed = current_signature
+            .zip(baseline_signature)
+            .map(|(current, baseline)| current.messages_hash != baseline.messages_hash);
+        let current_message_count = current_signature.map(|signature| signature.message_count);
+        let baseline_message_count = baseline_signature.map(|signature| signature.message_count);
+        let current_tool_count = current_signature.map(|signature| signature.tool_count);
+        let baseline_tool_count = baseline_signature.map(|signature| signature.tool_count);
+
+        crate::logging::info(&format!(
+            "KV_CACHE_USAGE: turn={} call={} provider={} upstream={:?} model={} \
+             input={} cache_read={} cache_write={} read_pct={} write_pct={} \
+             optimal_input={:?} optimal_read_pct={:?} miss={} \
+             session_input={} session_read={} session_write={} session_read_pct={} \
+             session_optimal_input={} session_optimal_read_pct={:?} \
+             baseline_input={:?} baseline_age_secs={:?} prefix_matches={:?} \
+             system_changed={:?} tools_changed={:?} message_prefix_changed={:?} \
+             message_count={:?} baseline_message_count={:?} tool_count={:?} baseline_tool_count={:?}",
+            request.turn_number,
+            request.call_index,
+            request.provider,
+            request.upstream_provider,
+            request.model,
+            input_tokens,
+            read_tokens,
+            creation_tokens,
+            read_pct,
+            creation_pct,
+            optimal_input_tokens,
+            optimal_read_pct,
+            miss,
+            self.total_cache_reported_input_tokens,
+            self.total_cache_read_tokens,
+            self.total_cache_creation_tokens,
+            session_read_pct,
+            self.total_cache_optimal_input_tokens,
+            session_optimal_read_pct,
+            baseline_input_tokens,
+            baseline_age_secs,
+            request.baseline_messages_prefix_matches,
+            system_static_hash_changed,
+            tools_hash_changed,
+            message_prefix_hash_changed,
+            current_message_count,
+            baseline_message_count,
+            current_tool_count,
+            baseline_tool_count,
+        ));
+    }
+
+    fn fallback_pending_kv_cache_request(&self) -> PendingKvCacheRequest {
+        PendingKvCacheRequest {
+            turn_number: self
+                .display_messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count()
+                .max(1),
+            call_index: 1,
+            provider: self.kv_cache_provider_name(),
+            model: self.kv_cache_provider_model(),
+            upstream_provider: self.upstream_provider.clone(),
+            signature: None,
+            baseline_messages_prefix_matches: None,
+            baseline: self.kv_cache_baseline.clone(),
+        }
+    }
+
+    fn record_kv_cache_miss_sample(&mut self, request: &PendingKvCacheRequest) {
+        let Some(baseline) = request.baseline.as_ref() else {
+            return;
+        };
+        let expected_tokens = baseline.input_tokens;
+        if expected_tokens == 0 {
+            return;
+        }
+
+        let read_tokens = self.streaming_cache_read_tokens.unwrap_or(0);
+        let missed_tokens = expected_tokens.saturating_sub(read_tokens);
+        if missed_tokens < Self::KV_CACHE_MIN_MISSED_TOKENS {
+            return;
+        }
+
+        let optimal_pct = ratio_pct(read_tokens, expected_tokens);
+        let reason =
+            self.classify_kv_cache_miss_reason(request, baseline, read_tokens, optimal_pct);
+        if optimal_pct >= Self::KV_CACHE_OPTIMAL_OK_PCT
+            && !matches!(
+                reason,
+                KvCacheMissReason::ProviderSwitch
+                    | KvCacheMissReason::ModelSwitch
+                    | KvCacheMissReason::UpstreamSwitch
+                    | KvCacheMissReason::Expired
+                    | KvCacheMissReason::HarnessSystemChanged
+                    | KvCacheMissReason::HarnessToolsChanged
+                    | KvCacheMissReason::HarnessPrefixChanged
+            )
+        {
+            return;
+        }
+
+        self.kv_cache_miss_samples.push(KvCacheMissSample {
+            turn_number: request.turn_number,
+            call_index: request.call_index,
+            missed_tokens,
+            reason,
+        });
+        if self.kv_cache_miss_samples.len() > Self::KV_CACHE_MAX_MISS_SAMPLES {
+            let overflow = self.kv_cache_miss_samples.len() - Self::KV_CACHE_MAX_MISS_SAMPLES;
+            self.kv_cache_miss_samples.drain(0..overflow);
+        }
+    }
+
+    fn classify_kv_cache_miss_reason(
+        &self,
+        request: &PendingKvCacheRequest,
+        baseline: &KvCacheBaseline,
+        read_tokens: u64,
+        optimal_pct: u8,
+    ) -> KvCacheMissReason {
+        if baseline.provider != request.provider {
+            return KvCacheMissReason::ProviderSwitch;
+        }
+        if baseline.model != request.model {
+            return KvCacheMissReason::ModelSwitch;
+        }
+        if baseline.upstream_provider.is_some()
+            && request.upstream_provider.is_some()
+            && baseline.upstream_provider != request.upstream_provider
+        {
+            return KvCacheMissReason::UpstreamSwitch;
+        }
+
+        if let Some(ttl_secs) =
+            crate::tui::cache_ttl_for_provider_model(&baseline.provider, Some(&baseline.model))
+            && baseline.completed_at.elapsed() >= Duration::from_secs(ttl_secs)
+        {
+            return KvCacheMissReason::Expired;
+        }
+
+        if let (Some(previous), Some(current)) = (&baseline.signature, &request.signature) {
+            if previous.system_static_hash != current.system_static_hash {
+                return KvCacheMissReason::HarnessSystemChanged;
+            }
+            if previous.tools_hash != current.tools_hash
+                || previous.tool_count != current.tool_count
+            {
+                return KvCacheMissReason::HarnessToolsChanged;
+            }
+        }
+
+        if request.baseline_messages_prefix_matches == Some(false) {
+            return KvCacheMissReason::HarnessPrefixChanged;
+        }
+
+        if self.streaming_cache_read_tokens.is_none() {
+            return KvCacheMissReason::Unknown;
+        }
+        if read_tokens == 0 {
+            return KvCacheMissReason::ZeroRead;
+        }
+        if optimal_pct < Self::KV_CACHE_OPTIMAL_OK_PCT {
+            return KvCacheMissReason::LowRead;
+        }
+        KvCacheMissReason::Unknown
+    }
+
+    fn kv_cache_provider_name(&self) -> String {
+        if self.is_remote || self.is_replay {
+            self.remote_provider_name
+                .clone()
+                .unwrap_or_else(|| self.provider.name().to_string())
+        } else {
+            self.provider.name().to_string()
+        }
+    }
+
+    fn kv_cache_provider_model(&self) -> String {
+        if self.is_remote || self.is_replay {
+            self.remote_provider_model
+                .clone()
+                .unwrap_or_else(|| self.provider.model())
+        } else {
+            self.provider.model()
+        }
+    }
+
+    fn kv_cache_request_signature(
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system_static: &str,
+    ) -> KvCacheRequestSignature {
+        KvCacheRequestSignature {
+            system_static_hash: stable_hash_str(system_static),
+            tools_hash: stable_hash_json(tools),
+            messages_hash: stable_hash_json(messages),
+            message_count: messages.len(),
+            tool_count: tools.len(),
+        }
+    }
+
+    fn kv_cache_messages_prefix_matches(
+        messages: &[Message],
+        previous: &KvCacheRequestSignature,
+    ) -> bool {
+        if previous.message_count > messages.len() {
+            return false;
+        }
+        stable_hash_json(&messages[..previous.message_count]) == previous.messages_hash
+    }
+}
+
+fn stable_hash_str(value: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn stable_hash_json<T: serde::Serialize + ?Sized>(value: &T) -> u64 {
+    let encoded = serde_json::to_string(value).unwrap_or_default();
+    stable_hash_str(&encoded)
+}
+
+fn ratio_pct(numerator: u64, denominator: u64) -> u8 {
+    if denominator == 0 {
+        0
+    } else {
+        ((numerator as f32 / denominator as f32) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
+    }
 }
 
 #[cfg(test)]

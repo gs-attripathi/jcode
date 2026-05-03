@@ -253,27 +253,15 @@ impl App {
     }
 
     fn start_jcode_login(&mut self) {
-        self.push_display_message(DisplayMessage::system(format!(
-            "**Jcode Subscription Login**\n\nPaste your jcode subscription API key. This is distinct from OpenRouter BYOK and is meant for curated jcode-managed access.\n\nCurated entries: {}\n\nOptional: after the key, jcode can also store a custom router base URL if you have one.",
-            crate::subscription_catalog::curated_models()
-                .iter()
-                .map(|model| model.display_name)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-        self.set_status_notice("Login: jcode API key...");
-        self.begin_pending_login(PendingLogin::ApiKeyProfile {
-            provider_id: "jcode".to_string(),
-            provider: "Jcode Subscription".to_string(),
-            auth_method: "api_key".to_string(),
-            docs_url: "https://subscription.jcode.invalid".to_string(),
-            env_file: crate::subscription_catalog::JCODE_ENV_FILE.to_string(),
-            key_name: crate::subscription_catalog::JCODE_API_KEY_ENV.to_string(),
-            default_model: Some(crate::subscription_catalog::default_model().id.to_string()),
-            endpoint: None,
-            api_key_optional: false,
-            openai_compatible_profile: None,
-        });
+        self.push_display_message(DisplayMessage::system(
+            "**Jcode Subscription Login**\n\n\
+             This doesn't exist yet.\n\n\
+             This would be a managed API key for a curated list of models chosen for good compatibility with jcode. It would be net-zero profit: your dollars would go toward tokens as much as possible. This subscription would be required for the mobile app version.\n\n\
+             Jcode currently has no way of making money. Net-zero profit may change in the distant future if jcode reaches a scale where it can be profitable while still subsidizing token costs.\n\n\
+             If you are interested in this, please tell Jeremy."
+                .to_string(),
+        ));
+        self.set_status_notice("Login: jcode unavailable");
     }
 
     pub(super) fn start_claude_login_for_account(&mut self, label: &str) {
@@ -317,7 +305,7 @@ impl App {
             "**Claude OAuth Login** (account: `{}`)\n\n\
              Opening browser for authentication...\n\n\
              If the browser didn't open, visit:\n{}\n\n\
-             {}{}{}After logging in, copy the callback URL or authorization code and **paste it here**.{}",
+             {}{}{}After logging in, copy the callback URL or authorization code and **paste it here**. Type `/cancel` to abort.{}",
             label,
             auth_url,
             if preflight.is_empty() { "" } else { &preflight },
@@ -567,7 +555,7 @@ impl App {
              **Note:** Wait a few seconds for the page to fully load before clicking Continue. \
              OpenAI's verification system may briefly disable the button.\n\n\
              {}{}{}\
-             Or paste the full callback URL or query string here to finish from another device.{}",
+             Or paste the full callback URL or query string here to finish from another device. Type `/cancel` to abort.{}",
             label,
             auth_url,
             if preflight.is_empty() {
@@ -783,7 +771,7 @@ impl App {
              Opening browser for authentication...\n\n\
              If the browser didn't open, visit:\n{}\n\n\
              {}{}{}\
-             Or paste the full callback URL, query string, or authorization code here to finish.{}",
+             Or paste the full callback URL, query string, or authorization code here to finish. Type `/cancel` to abort.{}",
             auth_url,
             if preflight.is_empty() {
                 String::new()
@@ -829,7 +817,7 @@ impl App {
                 "**{} Endpoint**\n\n\
                  Setup docs: {}\n\
                  Current API base: `{}`\n\n\
-                 **Paste the API base below**. Press Enter to keep the current value.",
+                 **Paste the API base below**. Press Enter to keep the current value, or type `/cancel` to abort.",
                 resolved.display_name, resolved.setup_url, resolved.api_base
             )));
             self.set_status_notice("Login: API base...");
@@ -879,9 +867,9 @@ impl App {
             .map(|endpoint| format!("Endpoint: `{}`\n", endpoint))
             .unwrap_or_default();
         let prompt = if api_key_optional {
-            "**Paste your API key below** if your endpoint requires one. Press Enter to skip."
+            "**Paste your API key below** if your endpoint requires one. Press Enter to skip, or type `/cancel` to abort."
         } else {
-            "**Paste your API key below** (it will be saved securely)."
+            "**Paste your API key below** (it will be saved securely), or type `/cancel` to abort."
         };
         self.push_display_message(DisplayMessage::system(format!(
             "**{} {}**\n\n\
@@ -983,7 +971,7 @@ impl App {
              (Dashboard > Integrations > User API Keys)\n\n\
              jcode will save it securely and provide it to `cursor-agent` at runtime.\n\
              You still need Cursor Agent installed to use the Cursor provider.\n\n\
-             **Paste your API key below**."
+             **Paste your API key below**, or type `/cancel` to abort."
                 .to_string(),
         ));
         self.set_status_notice("Login: paste cursor key...");
@@ -1089,7 +1077,7 @@ impl App {
 
         self.push_display_message(DisplayMessage::system(
             "**GitHub Copilot Login**\n\n\
-             Starting device flow... please wait."
+             Starting device flow... please wait. Type `/cancel` to abort."
                 .to_string(),
         ));
     }
@@ -1203,7 +1191,7 @@ impl App {
              Opening browser for authentication...\n\n\
              If the browser didn't open, visit:\n{}\n\n\
              {}{}{}{}\
-             Or paste the full callback URL or query string here to finish.{}",
+             Or paste the full callback URL or query string here to finish. Type `/cancel` to abort.{}",
             auth_url,
             if preflight.is_empty() {
                 String::new()

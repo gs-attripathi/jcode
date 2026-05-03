@@ -12,10 +12,11 @@ pub(crate) const SINGLE_SESSION_FONT_FALLBACKS: &[&str] = &[
     "JetBrains Mono",
     "monospace",
 ];
-pub(crate) const SINGLE_SESSION_TITLE_FONT_SIZE: f32 = 28.0;
-pub(crate) const SINGLE_SESSION_BODY_FONT_SIZE: f32 = 22.0;
-pub(crate) const SINGLE_SESSION_META_FONT_SIZE: f32 = 16.0;
-pub(crate) const SINGLE_SESSION_CODE_FONT_SIZE: f32 = 21.0;
+pub(crate) const SINGLE_SESSION_DEFAULT_FONT_SIZE: f32 = 22.0;
+pub(crate) const SINGLE_SESSION_TITLE_FONT_SIZE: f32 = SINGLE_SESSION_DEFAULT_FONT_SIZE;
+pub(crate) const SINGLE_SESSION_BODY_FONT_SIZE: f32 = SINGLE_SESSION_DEFAULT_FONT_SIZE;
+pub(crate) const SINGLE_SESSION_META_FONT_SIZE: f32 = SINGLE_SESSION_DEFAULT_FONT_SIZE;
+pub(crate) const SINGLE_SESSION_CODE_FONT_SIZE: f32 = SINGLE_SESSION_DEFAULT_FONT_SIZE;
 pub(crate) const SINGLE_SESSION_BODY_LINE_HEIGHT: f32 = 1.45;
 pub(crate) const SINGLE_SESSION_CODE_LINE_HEIGHT: f32 = 1.35;
 pub(crate) const SINGLE_SESSION_META_LINE_HEIGHT: f32 = 1.25;
@@ -566,7 +567,7 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn has_background_work(&self) -> bool {
-        self.is_processing
+        self.has_activity_indicator()
     }
 
     fn current_session_id(&self) -> Option<&str> {
@@ -1959,55 +1960,83 @@ fn dedupe_model_choices(choices: Vec<DesktopModelChoice>) -> Vec<DesktopModelCho
     deduped
 }
 
+struct HelpSection {
+    title: &'static str,
+    shortcuts: &'static [(&'static str, &'static str)],
+}
+
+const SINGLE_SESSION_HELP_SECTIONS: &[HelpSection] = &[
+    HelpSection {
+        title: "chat",
+        shortcuts: &[
+            ("Enter", "send prompt"),
+            ("Shift+Enter", "insert newline"),
+            ("Ctrl+Enter", "queue while running, send when idle"),
+            ("Ctrl+C", "interrupt running generation"),
+            ("Ctrl+Shift+C", "copy latest assistant response"),
+            ("Ctrl+V", "paste clipboard text"),
+            ("Ctrl+V", "paste clipboard image when no text is present"),
+            ("Ctrl+I", "attach clipboard image to next prompt"),
+            ("Ctrl+Shift+I", "clear pending image attachments"),
+            ("Ctrl+Shift+M", "open model/account picker"),
+            ("Ctrl+M/N", "switch to next/previous model"),
+            ("Ctrl+P/O", "open recent session switcher"),
+        ],
+    },
+    HelpSection {
+        title: "navigation",
+        shortcuts: &[
+            ("PageUp/PageDown", "scroll transcript"),
+            ("Alt+Up/Down", "jump between user prompts"),
+            ("Mouse wheel", "scroll transcript"),
+        ],
+    },
+    HelpSection {
+        title: "editing",
+        shortcuts: &[
+            ("Ctrl+A/E", "start/end of line"),
+            ("Ctrl+U/K", "delete to line start/end"),
+            ("Ctrl+Backspace", "delete previous word"),
+            ("Alt+B/F", "move by word"),
+            ("Alt+D", "delete next word"),
+            ("Ctrl+Z", "undo input edit"),
+        ],
+    },
+    HelpSection {
+        title: "window",
+        shortcuts: &[
+            ("Ctrl+;", "reset/spawn fresh desktop session"),
+            ("Ctrl+R", "reload sessions/models while a picker is open"),
+            ("Ctrl+?", "toggle this help"),
+            ("Esc", "close help or quit"),
+        ],
+    },
+];
+
 fn single_session_help_styled_lines() -> Vec<SingleSessionStyledLine> {
-    [
-        "desktop shortcuts",
-        "",
-        "chat",
-        "  Enter       send prompt",
-        "  Shift+Enter insert newline",
-        "  Ctrl+Enter  queue while running, send when idle",
-        "  Ctrl+C      interrupt running generation",
-        "  Ctrl+Shift+C copy latest assistant response",
-        "  Ctrl+V      paste clipboard text",
-        "  Ctrl+V      paste clipboard image when no text is present",
-        "  Ctrl+I      attach clipboard image to next prompt",
-        "  Ctrl+Shift+I clear pending image attachments",
-        "  Ctrl+Shift+M open model/account picker",
-        "  Ctrl+M/N    switch to next/previous model",
-        "  Ctrl+P/O    open recent session switcher",
-        "",
-        "navigation",
-        "  PageUp/PageDown scroll transcript",
-        "  Alt+Up/Down jump between user prompts",
-        "  Mouse wheel scroll transcript",
-        "",
-        "editing",
-        "  Ctrl+A/E    start/end of line",
-        "  Ctrl+U/K    delete to line start/end",
-        "  Ctrl+Backspace delete previous word",
-        "  Alt+B/F     move by word",
-        "  Alt+D       delete next word",
-        "  Ctrl+Z      undo input edit",
-        "",
-        "window",
-        "  Ctrl+;      reset/spawn fresh desktop session",
-        "  Ctrl+R      reload sessions/models while a picker is open",
-        "  Ctrl+?      toggle this help",
-        "  Esc         close help or quit",
-    ]
-    .into_iter()
-    .map(|line| {
-        let style = if line.is_empty() {
-            SingleSessionLineStyle::Blank
-        } else if line.starts_with("  ") {
-            SingleSessionLineStyle::Overlay
-        } else {
-            SingleSessionLineStyle::OverlayTitle
-        };
-        styled_line(line, style)
-    })
-    .collect()
+    let mut lines = vec![
+        styled_line("desktop shortcuts", SingleSessionLineStyle::OverlayTitle),
+        blank_styled_line(),
+    ];
+
+    for (section_index, section) in SINGLE_SESSION_HELP_SECTIONS.iter().enumerate() {
+        if section_index > 0 {
+            lines.push(blank_styled_line());
+        }
+        lines.push(styled_line(
+            section.title,
+            SingleSessionLineStyle::OverlayTitle,
+        ));
+        lines.extend(section.shortcuts.iter().map(|(shortcut, description)| {
+            let separator = if shortcut.len() >= 12 { " " } else { "" };
+            styled_line(
+                format!("  {shortcut:<12}{separator}{description}"),
+                SingleSessionLineStyle::Overlay,
+            )
+        }));
+    }
+
+    lines
 }
 
 fn append_chat_message_lines(

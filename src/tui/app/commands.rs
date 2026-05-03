@@ -19,8 +19,8 @@ pub(super) use super::commands_review::{
     reset_current_session,
 };
 pub(super) use super::todos_view::handle_todos_view_command;
-use super::{App, DisplayMessage, ProcessingStatus};
-use crate::bus::{Bus, BusEvent, ManualToolCompleted, ToolEvent, ToolStatus};
+use super::{App, DisplayMessage, LocalRewindUndoSnapshot, ProcessingStatus};
+use crate::bus::{Bus, BusEvent, GitStatusCompleted, ManualToolCompleted, ToolEvent, ToolStatus};
 use crate::id;
 use crate::message::{ContentBlock, Message, Role};
 use std::path::PathBuf;
@@ -65,37 +65,6 @@ pub(super) fn is_poke_message(message: &str) -> bool {
     message.starts_with("You have ")
         && message.contains(" incomplete todo")
         && message.ends_with("update the todo tool.")
-}
-
-fn message_content_preview(message: &Message) -> String {
-    for block in &message.content {
-        match block {
-            ContentBlock::Text { text, .. } => {
-                let text = text.trim();
-                if !text.is_empty() {
-                    return text.replace('\n', " ");
-                }
-            }
-            ContentBlock::ToolUse { name, .. } => {
-                return format!("[tool: {}]", name);
-            }
-            ContentBlock::ToolResult { content, .. } => {
-                let preview = content.trim().replace('\n', " ");
-                if !preview.is_empty() {
-                    return format!("[result: {}]", preview);
-                }
-            }
-            _ => {}
-        }
-    }
-    "(empty)".to_string()
-}
-
-fn message_role_label(role: &Role) -> &'static str {
-    match role {
-        Role::User => "👤 User",
-        Role::Assistant => "🤖 Assistant",
-    }
 }
 
 pub(super) fn queued_messages_are_only_pokes(messages: &[String]) -> bool {
@@ -973,8 +942,7 @@ fn run_git_command(repo_dir: &std::path::Path, args: &[&str]) -> Result<String, 
         .to_string())
 }
 
-fn build_git_status_message(app: &App) -> Result<String, String> {
-    let repo_dir = git_command_repo_dir(app)?;
+fn build_git_status_message_for_dir(repo_dir: PathBuf) -> Result<String, String> {
     let repo_root =
         run_git_command(&repo_dir, &["rev-parse", "--show-toplevel"]).map_err(|error| {
             format!(
@@ -1018,14 +986,94 @@ fn handle_git_command(app: &mut App, trimmed: &str) -> bool {
         return false;
     }
 
-    match build_git_status_message(app) {
+    let session_id = active_session_id(app);
+    match git_command_repo_dir(app) {
+        Ok(repo_dir) => {
+            app.set_status_notice("Git status loading...");
+            std::thread::spawn(move || {
+                let result = build_git_status_message_for_dir(repo_dir);
+                Bus::global().publish(BusEvent::GitStatusCompleted(GitStatusCompleted {
+                    session_id,
+                    result,
+                }));
+            });
+        }
+        Err(error) => app.push_display_message(DisplayMessage::error(error)),
+    }
+    true
+}
+
+fn transcript_opened_message(path: &std::path::Path) -> String {
+    format!(
+        "Opened transcript file:\n\n```text\n{}\n```",
+        path.display()
+    )
+}
+
+fn transcript_path_message(path: &std::path::Path) -> String {
+    format!("Transcript file:\n\n```text\n{}\n```", path.display())
+}
+
+fn handle_transcript_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/transcript" && trimmed != "/transcript path" {
+        if trimmed.starts_with("/transcript ") {
+            app.push_display_message(DisplayMessage::error(
+                "Usage: `/transcript` or `/transcript path`".to_string(),
+            ));
+            return true;
+        }
+        return false;
+    }
+
+    let session_id = active_session_id(app);
+    let path = match crate::session::session_path(&session_id) {
+        Ok(path) => path,
+        Err(error) => {
+            app.push_display_message(DisplayMessage::error(format!(
+                "Failed to resolve transcript path: {}",
+                error
+            )));
+            return true;
+        }
+    };
+
+    if !app.is_remote && app.session.id == session_id {
+        let _ = app.session.save();
+    }
+
+    if trimmed == "/transcript path" {
+        app.push_display_message(DisplayMessage::system(transcript_path_message(&path)));
+        app.set_status_notice("Transcript path");
+        return true;
+    }
+
+    match open::that_detached(&path) {
+        Ok(()) => {
+            app.push_display_message(DisplayMessage::system(transcript_opened_message(&path)));
+            app.set_status_notice("Transcript opened");
+        }
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Failed to open transcript file `{}`: {}",
+            path.display(),
+            error
+        ))),
+    }
+
+    true
+}
+
+pub(super) fn handle_git_status_completed(app: &mut App, completed: GitStatusCompleted) {
+    if completed.session_id != active_session_id(app) {
+        return;
+    }
+
+    match completed.result {
         Ok(message) => {
             app.push_display_message(DisplayMessage::system(message));
             app.set_status_notice("Git status");
         }
         Err(error) => app.push_display_message(DisplayMessage::error(error)),
     }
-    true
 }
 
 pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
@@ -1033,8 +1081,10 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         || handle_subagent_command(app, trimmed)
         || handle_observe_command(app, trimmed)
         || handle_todos_view_command(app, trimmed)
+        || super::commands_overnight::handle_overnight_command(app, trimmed)
         || super::split_view::handle_split_view_command(app, trimmed)
         || handle_btw_command(app, trimmed)
+        || handle_transcript_command(app, trimmed)
         || handle_git_command(app, trimmed)
         || handle_catchup_command(app, trimmed)
         || handle_back_command(app, trimmed)
@@ -1222,139 +1272,16 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     // In remote mode the live session is owned by the server; let the
-    // remote dispatcher in key_handling.rs send the RPC. Otherwise this
-    // local handler would mutate only the TUI's mirror and lie about success.
-    if app.is_remote
-        && (trimmed == "/rewind"
-            || trimmed.starts_with("/rewind ")
-            || trimmed.starts_with("/checkout "))
-    {
+    // remote dispatcher in remote/key_handling.rs send the RPC. Otherwise
+    // this local handler would mutate only the TUI's mirror.
+    if app.is_remote && trimmed.starts_with("/checkout ") {
         return false;
     }
 
-    if trimmed == "/rewind" {
-        let provider_messages;
-        let use_provider_messages = app.session.messages.is_empty();
-        if use_provider_messages {
-            provider_messages = app.materialized_provider_messages();
-        } else {
-            provider_messages = Vec::new();
-        }
-
-        if app.session.messages.is_empty() && provider_messages.is_empty() {
-            app.push_display_message(DisplayMessage::system(
-                "No messages in conversation.".to_string(),
-            ));
-            return true;
-        }
-
-        let mut history = String::from("**Conversation history:**\n\n");
-        if use_provider_messages {
-            for (i, msg) in provider_messages.iter().enumerate() {
-                let role_str = message_role_label(&msg.role);
-                let content = message_content_preview(msg);
-                let preview = crate::util::truncate_str(&content, 80);
-                history.push_str(&format!("  `{}` {} - {}\n", i + 1, role_str, preview));
-            }
-        } else {
-            for (i, msg) in app.session.messages.iter().enumerate() {
-                let role_str = message_role_label(&msg.role);
-                let content = msg.content_preview();
-                let preview = crate::util::truncate_str(&content, 80);
-                history.push_str(&format!("  `{}` {} - {}\n", i + 1, role_str, preview));
-            }
-        }
-        history.push_str("\nUse `/rewind N` to rewind to message N (removes all messages after).");
-
-        app.push_display_message(DisplayMessage::system(history));
-        return true;
-    }
-
-    if let Some(num_str) = trimmed.strip_prefix("/rewind ") {
-        let num_str = num_str.trim();
-        let provider_messages = if app.session.messages.is_empty() {
-            app.materialized_provider_messages()
-        } else {
-            Vec::new()
-        };
-        let valid_len = if app.session.messages.is_empty() {
-            provider_messages.len()
-        } else {
-            app.session.messages.len()
-        };
-
-        match num_str.parse::<usize>() {
-            Ok(n) if n > 0 && n <= app.session.messages.len() => {
-                let removed = app.session.messages.len() - n;
-                app.session.truncate_messages(n);
-                let provider_messages = app.session.messages_for_provider_uncached();
-                app.replace_provider_messages(provider_messages);
-                app.session.updated_at = chrono::Utc::now();
-
-                app.clear_display_messages();
-                for rendered in crate::session::render_messages(&app.session) {
-                    app.push_display_message(DisplayMessage {
-                        role: rendered.role,
-                        content: rendered.content,
-                        tool_calls: rendered.tool_calls,
-                        duration_secs: None,
-                        title: None,
-                        tool_data: rendered.tool_data,
-                    });
-                }
-
-                app.provider_session_id = None;
-                app.session.provider_session_id = None;
-                let _ = app.session.save();
-
-                app.push_display_message(DisplayMessage::system(format!(
-                    "✓ Rewound to message {}. Removed {} message{}.",
-                    n,
-                    removed,
-                    if removed == 1 { "" } else { "s" }
-                )));
-            }
-            Ok(n) if app.session.messages.is_empty() && n > 0 && n <= provider_messages.len() => {
-                let removed = provider_messages.len() - n;
-                let rewound_messages = provider_messages[..n].to_vec();
-                app.replace_provider_messages(rewound_messages);
-                app.session.updated_at = chrono::Utc::now();
-
-                app.provider_session_id = None;
-                app.session.provider_session_id = None;
-                let _ = app.session.save();
-
-                app.push_display_message(DisplayMessage::system(format!(
-                    "✓ Rewound to message {}. Removed {} message{}.",
-                    n,
-                    removed,
-                    if removed == 1 { "" } else { "s" }
-                )));
-            }
-            Ok(n) => {
-                app.push_display_message(DisplayMessage::error(format!(
-                    "Invalid message number: {}. Valid range: 1-{}",
-                    n, valid_len
-                )));
-            }
-            Err(_) => {
-                app.push_display_message(DisplayMessage::error(format!(
-                    "Usage: `/rewind N` where N is a message number (1-{})",
-                    valid_len
-                )));
-            }
-        }
-        return true;
-    }
-
     if trimmed == "/branches" {
-        // In remote/server mode the live session is owned by the server and
-        // `app.session.messages` on the TUI side is empty. Fall back to
-        // reading the persisted session from disk so the tree is visible
-        // regardless of execution mode. The disk lookup MUST use the
-        // server's session id (from `active_client_session_id`) — the local
-        // `app.session.id` is a TUI-side placeholder in remote mode and
-        // doesn't correspond to a file on disk.
+        // Read session state straight from disk — works in both standalone
+        // and remote mode. In remote, app.session.messages is empty (the
+        // live state lives on the server) so disk is the source of truth.
         let lookup_id = app
             .active_client_session_id()
             .unwrap_or(app.session.id.as_str())
@@ -1373,8 +1300,6 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             ));
             return true;
         }
-        // The "current" leaf is the real (non-system) message at the tip of
-        // the active branch — walk past navigation notes to find it.
         let active = session_ref.active_real_leaf().map(|m| m.id.clone());
         let mut sorted: Vec<&crate::session::StoredMessage> = leaves;
         sorted.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
@@ -1400,6 +1325,7 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             ));
             return true;
         }
+        // Standalone-mode checkout: mutate locally. Remote mode bails above.
         let target_id = match app.session.find_message_by_short_id(arg) {
             Some(m) => m.id.clone(),
             None => {
@@ -1411,8 +1337,6 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             }
         };
 
-        // Only allow checkout to a leaf for now — moves cursor to a branch tip
-        // so subsequent prompts extend that branch.
         let leaf_ids: std::collections::HashSet<String> =
             app.session.leaves().iter().map(|m| m.id.clone()).collect();
         if !leaf_ids.contains(&target_id) {
@@ -1422,7 +1346,13 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
             return true;
         }
 
+        let short = crate::session::Session::short_id(&target_id);
+        app.session
+            .add_user_command(format!("/checkout @{}", short));
         app.session.set_active_leaf(target_id.clone());
+        app.session
+            .add_system_note(format!("✓ Switched to branch `@{}`.", short));
+
         let provider_messages = app.session.messages_for_provider_uncached();
         app.replace_provider_messages(provider_messages);
         app.session.updated_at = chrono::Utc::now();
@@ -1440,11 +1370,126 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         app.provider_session_id = None;
         app.session.provider_session_id = None;
         let _ = app.session.save();
-        let short = crate::session::Session::short_id(&target_id);
+        return true;
+    }
+
+    if trimmed == "/rewind undo" {
+        let Some(snapshot) = app.rewind_undo_snapshot.take() else {
+            app.push_display_message(DisplayMessage::system("No rewind to undo.".to_string()));
+            return true;
+        };
+
+        let current_count = app.session.visible_conversation_message_count();
+        let restored = snapshot.visible_message_count.saturating_sub(current_count);
+        app.session.replace_messages(snapshot.messages);
+        app.provider_session_id = snapshot.provider_session_id;
+        app.session.provider_session_id = snapshot.session_provider_session_id;
+        app.session.updated_at = chrono::Utc::now();
+        let provider_messages = app.session.messages_for_provider_uncached();
+        app.replace_provider_messages(provider_messages);
+
+        app.clear_display_messages();
+        for rendered in crate::session::render_messages(&app.session) {
+            app.push_display_message(DisplayMessage {
+                role: rendered.role,
+                content: rendered.content,
+                tool_calls: rendered.tool_calls,
+                duration_secs: None,
+                title: None,
+                tool_data: rendered.tool_data,
+            });
+        }
+
+        let _ = app.session.save();
         app.push_display_message(DisplayMessage::system(format!(
-            "✓ Switched to branch `@{}`.",
-            short
+            "✓ Undid rewind. Restored {} message{}.",
+            restored,
+            if restored == 1 { "" } else { "s" }
         )));
+        return true;
+    }
+
+    if trimmed == "/rewind" {
+        let visible_messages = app.session.visible_conversation_messages();
+        if visible_messages.is_empty() {
+            app.push_display_message(DisplayMessage::system(
+                "No messages in conversation.".to_string(),
+            ));
+            return true;
+        }
+
+        let mut history = String::from("**Conversation history:**\n\n");
+        for (i, msg) in visible_messages.iter().enumerate() {
+            let role_str = match msg.role {
+                Role::User => "👤 User",
+                Role::Assistant => "🤖 Assistant",
+            };
+            let content = msg.content_preview();
+            let preview = crate::util::truncate_str(&content, 80);
+            history.push_str(&format!("  `{}` {} - {}\n", i + 1, role_str, preview));
+        }
+        history.push_str("\nUse `/rewind N` to rewind to message N (removes all messages after). After rewinding, use `/rewind undo` to restore the removed messages.");
+
+        app.push_display_message(DisplayMessage::system(history));
+        return true;
+    }
+
+    if let Some(num_str) = trimmed.strip_prefix("/rewind ") {
+        let num_str = num_str.trim();
+        let visible_count = app.session.visible_conversation_message_count();
+        match num_str.parse::<usize>() {
+            Ok(n) if n > 0 && n <= visible_count => {
+                let removed = visible_count - n;
+                app.rewind_undo_snapshot = Some(LocalRewindUndoSnapshot {
+                    messages: app.session.messages.clone(),
+                    provider_session_id: app.provider_session_id.clone(),
+                    session_provider_session_id: app.session.provider_session_id.clone(),
+                    visible_message_count: visible_count,
+                });
+                if let Some(stored_len) = app.session.stored_len_for_visible_conversation_message(n)
+                {
+                    app.session.truncate_messages(stored_len);
+                }
+                let provider_messages = app.session.messages_for_provider_uncached();
+                app.replace_provider_messages(provider_messages);
+                app.session.updated_at = chrono::Utc::now();
+
+                app.clear_display_messages();
+                for rendered in crate::session::render_messages(&app.session) {
+                    app.push_display_message(DisplayMessage {
+                        role: rendered.role,
+                        content: rendered.content,
+                        tool_calls: rendered.tool_calls,
+                        duration_secs: None,
+                        title: None,
+                        tool_data: rendered.tool_data,
+                    });
+                }
+
+                app.provider_session_id = None;
+                app.session.provider_session_id = None;
+                let _ = app.session.save();
+
+                app.push_display_message(DisplayMessage::system(format!(
+                    "✓ Rewound to message {}. Removed {} message{}. Undo anytime with `/rewind undo`.",
+                    n,
+                    removed,
+                    if removed == 1 { "" } else { "s" }
+                )));
+            }
+            Ok(n) => {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Invalid message number: {}. Valid range: 1-{}",
+                    n, visible_count
+                )));
+            }
+            Err(_) => {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Usage: `/rewind N` where N is a message number (1-{})",
+                    visible_count
+                )));
+            }
+        }
         return true;
     }
 
@@ -1829,55 +1874,7 @@ fn handle_alignment_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
-fn permission_mode_label(mode: crate::config::ToolPermissionMode) -> &'static str {
-    mode.as_str()
-}
-
-fn handle_permission_mode_command(app: &mut App, trimmed: &str) -> bool {
-    if trimmed != "/mode" && !trimmed.starts_with("/mode ") {
-        return false;
-    }
-
-    let rest = trimmed.strip_prefix("/mode").unwrap_or_default().trim();
-
-    if rest.is_empty() || matches!(rest, "status" | "show") {
-        let mode = crate::config::Config::load().safety.tool_permission_mode;
-        app.push_display_message(DisplayMessage::system(format!(
-            "Permission mode: **{}**\n\nUse `/mode ask` to require approvals, or `/mode autopilot` to allow every tool call without prompting.",
-            permission_mode_label(mode)
-        )));
-        return true;
-    }
-
-    let Some(mode) = crate::config::ToolPermissionMode::parse(rest) else {
-        app.push_display_message(DisplayMessage::error(
-            "Usage: `/mode`, `/mode ask`, or `/mode autopilot`".to_string(),
-        ));
-        return true;
-    };
-
-    match crate::config::Config::set_tool_permission_mode(mode) {
-        Ok(()) => {
-            app.set_status_notice(format!("Permission mode: {}", permission_mode_label(mode)));
-            app.push_display_message(DisplayMessage::system(format!(
-                "Saved permission mode: **{}**.",
-                permission_mode_label(mode)
-            )));
-        }
-        Err(error) => app.push_display_message(DisplayMessage::error(format!(
-            "Failed to save permission mode: {}",
-            error
-        ))),
-    }
-
-    true
-}
-
 pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
-    if handle_permission_mode_command(app, trimmed) {
-        return true;
-    }
-
     if handle_alignment_command(app, trimmed) {
         return true;
     }

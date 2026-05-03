@@ -16,7 +16,9 @@ use crate::message::{
 };
 use crate::provider_catalog::{
     OPENAI_COMPAT_PROFILE, is_safe_env_file_name, is_safe_env_key_name,
-    load_api_key_from_env_or_config, normalize_api_base, openai_compatible_profiles,
+    load_api_key_from_env_or_config, normalize_api_base, openai_compatible_profile_by_id,
+    openai_compatible_profile_id_for_api_base, openai_compatible_profile_static_context_limits,
+    openai_compatible_profile_static_models, openai_compatible_profiles,
     resolve_openai_compatible_profile,
 };
 use anyhow::{Context, Result};
@@ -174,6 +176,25 @@ fn configured_env_file_name() -> String {
     }
 }
 
+fn load_named_profile_api_key(
+    env_key: &str,
+    profile: &crate::config::NamedProviderConfig,
+) -> Option<String> {
+    if let Some(env_file) = profile
+        .env_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return load_api_key_from_env_or_config(env_key, env_file);
+    }
+
+    std::env::var(env_key)
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+}
+
 fn parse_env_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -282,12 +303,24 @@ fn is_kimi_coding_api_base(api_base: &str) -> bool {
         && url.path().trim_end_matches('/').starts_with("/coding")
 }
 
+fn is_coding_agent_api_base(api_base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(api_base) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    let path = url.path().trim_end_matches('/');
+    is_kimi_coding_api_base(api_base)
+        || host == "coding.dashscope.aliyuncs.com"
+        || host == "coding-intl.dashscope.aliyuncs.com"
+        || (host == "api.z.ai" && path.starts_with("/api/coding/paas"))
+}
+
 fn is_kimi_for_coding_model(model: &str) -> bool {
     model.trim().eq_ignore_ascii_case("kimi-for-coding")
 }
 
 fn should_send_kimi_coding_agent_headers(api_base: &str, model: Option<&str>) -> bool {
-    is_kimi_coding_api_base(api_base) || model.map(is_kimi_for_coding_model).unwrap_or(false)
+    is_coding_agent_api_base(api_base) || model.map(is_kimi_for_coding_model).unwrap_or(false)
 }
 
 fn apply_kimi_coding_agent_headers(
@@ -452,7 +485,9 @@ pub struct OpenRouterProvider {
     auth: ProviderAuth,
     supports_provider_features: bool,
     supports_model_catalog: bool,
+    profile_id: Option<String>,
     static_models: Vec<String>,
+    static_context_limits: HashMap<String, usize>,
     send_openrouter_headers: bool,
     models_cache: Arc<RwLock<ModelsCache>>,
     model_catalog_refresh: Arc<Mutex<ModelCatalogRefreshState>>,
@@ -478,17 +513,14 @@ impl OpenRouterProvider {
         let api_base = normalize_api_base(&profile.base_url).ok_or_else(|| {
             anyhow::anyhow!("Provider profile '{}' has invalid base_url", profile_name)
         })?;
-        let key_label = profile
+        let key_env = profile
             .api_key_env
             .as_deref()
             .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("inline api_key")
-            .to_string();
-        let key = profile
-            .api_key_env
-            .as_deref()
-            .and_then(|name| std::env::var(name).ok())
+            .filter(|v| !v.is_empty());
+        let key_label = key_env.unwrap_or("inline api_key").to_string();
+        let key = key_env
+            .and_then(|name| load_named_profile_api_key(name, profile))
             .or_else(|| profile.api_key.clone());
         let auth = match profile.auth {
             crate::config::NamedProviderAuth::None => ProviderAuth::None {
@@ -523,6 +555,19 @@ impl OpenRouterProvider {
             .filter(|id| !id.is_empty())
             .map(ToString::to_string)
             .collect::<Vec<_>>();
+        let static_context_limits = profile
+            .models
+            .iter()
+            .filter_map(|model| {
+                let id = model.id.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                model
+                    .context_window
+                    .map(|limit| (id.to_ascii_lowercase(), limit))
+            })
+            .collect::<HashMap<_, _>>();
         Ok(Self {
             client: crate::provider::shared_http_client(),
             model: Arc::new(RwLock::new(model)),
@@ -538,7 +583,9 @@ impl OpenRouterProvider {
                     profile.provider_type,
                     crate::config::NamedProviderType::OpenRouter
                 ),
+            profile_id: Some(profile_name.to_string()),
             static_models,
+            static_context_limits,
             send_openrouter_headers: false,
             models_cache: Arc::new(RwLock::new(ModelsCache::default())),
             model_catalog_refresh: Arc::new(Mutex::new(ModelCatalogRefreshState::default())),
@@ -580,6 +627,24 @@ impl OpenRouterProvider {
         let supports_model_catalog = model_catalog_enabled();
         let send_openrouter_headers = supports_provider_features;
         let auth = Self::resolve_auth()?;
+        let profile_id = std::env::var("JCODE_OPENROUTER_CACHE_NAMESPACE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .and_then(|id| openai_compatible_profile_by_id(&id).map(|_| id))
+            .or_else(|| {
+                autodetected_profile
+                    .as_ref()
+                    .map(|profile| profile.id.clone())
+            })
+            .or_else(|| {
+                openai_compatible_profile_id_for_api_base(&api_base).map(ToString::to_string)
+            });
+        let static_context_limits = profile_id
+            .as_deref()
+            .and_then(openai_compatible_profile_by_id)
+            .map(openai_compatible_profile_static_context_limits)
+            .unwrap_or_default();
         let static_models = std::env::var("JCODE_OPENROUTER_STATIC_MODELS")
             .ok()
             .map(|raw| {
@@ -589,7 +654,13 @@ impl OpenRouterProvider {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                autodetected_profile
+                    .as_ref()
+                    .and_then(|profile| openai_compatible_profile_by_id(&profile.id))
+                    .map(openai_compatible_profile_static_models)
+                    .unwrap_or_default()
+            });
 
         if std::env::var_os("JCODE_OPENROUTER_CACHE_NAMESPACE").is_none()
             && let Some(profile) = autodetected_profile.as_ref()
@@ -622,7 +693,9 @@ impl OpenRouterProvider {
             auth,
             supports_provider_features,
             supports_model_catalog,
+            profile_id,
             static_models,
+            static_context_limits,
             send_openrouter_headers,
             models_cache: Arc::new(RwLock::new(ModelsCache::default())),
             model_catalog_refresh: Arc::new(Mutex::new(ModelCatalogRefreshState::default())),
@@ -782,7 +855,9 @@ impl OpenRouterProvider {
                 auth,
                 supports_provider_features: true,
                 supports_model_catalog: true,
+                profile_id: None,
                 static_models: Vec::new(),
+                static_context_limits: HashMap::new(),
                 send_openrouter_headers: true,
                 models_cache: Arc::new(RwLock::new(ModelsCache::default())),
                 model_catalog_refresh: Arc::new(Mutex::new(ModelCatalogRefreshState::default())),
@@ -1223,11 +1298,11 @@ impl OpenRouterProvider {
 
         let key_name = configured_api_key_name();
         let api_key = Self::get_api_key().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} not found in environment or ~/.config/jcode/{}",
-                key_name,
-                configured_env_file_name()
-            )
+            let env_file = configured_env_file_name();
+            let path = crate::storage::app_config_dir()
+                .map(|dir| dir.join(&env_file).display().to_string())
+                .unwrap_or_else(|_| env_file.clone());
+            anyhow::anyhow!("{} not found in environment or {}", key_name, path)
         })?;
 
         Ok(match configured_auth_header_mode() {

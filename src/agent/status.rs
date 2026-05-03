@@ -90,6 +90,32 @@ impl Agent {
             })
     }
 
+    /// Latest non-empty assistant text added at or after `start_index`.
+    pub fn latest_assistant_text_after(&self, start_index: usize) -> Option<String> {
+        self.session
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                if index < start_index || !matches!(&message.role, Role::Assistant) {
+                    return None;
+                }
+
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let text = text.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            })
+    }
+
     pub fn last_upstream_provider(&self) -> Option<String> {
         self.last_upstream_provider
             .clone()
@@ -105,7 +131,7 @@ impl Agent {
     }
 
     pub fn provider_name(&self) -> String {
-        self.provider.name().to_string()
+        crate::provider_catalog::runtime_provider_display_name(self.provider.name())
     }
 
     pub fn provider_model(&self) -> String {

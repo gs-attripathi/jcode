@@ -464,6 +464,18 @@ fn test_top_level_command_suggestions_include_catchup_and_back() {
 
     let suggestions = app.get_suggestions_for("/gi");
     assert!(suggestions.iter().any(|(cmd, _)| cmd == "/git"));
+
+    let suggestions = app.get_suggestions_for("/tran");
+    assert!(suggestions.iter().any(|(cmd, _)| cmd == "/transcript"));
+}
+
+#[test]
+fn test_transcript_command_suggestions_include_path_variant() {
+    let app = create_test_app();
+
+    let suggestions = app.get_suggestions_for("/transcript p");
+
+    assert!(suggestions.iter().any(|(cmd, _)| cmd == "/transcript path"));
 }
 
 #[test]

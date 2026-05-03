@@ -14,6 +14,7 @@ fn test_context_limit_error_detection() {
 #[test]
 fn test_rewind_truncates_provider_messages() {
     let mut app = create_test_app();
+    app.session.replace_messages(Vec::new());
 
     for idx in 1..=3 {
         let text = format!("msg-{}", idx);
@@ -43,46 +44,77 @@ fn test_rewind_truncates_provider_messages() {
 }
 
 #[test]
-fn test_rewind_lists_provider_messages_when_session_messages_empty() {
+fn test_rewind_undo_restores_truncated_messages() {
+    let mut app = create_test_app();
+    app.session.replace_messages(Vec::new());
+
+    for idx in 1..=3 {
+        let text = format!("msg-{}", idx);
+        app.add_provider_message(Message::user(&text));
+        app.session.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text,
+                cache_control: None,
+            }],
+        );
+    }
+    app.provider_session_id = Some("provider-session".to_string());
+    app.session.provider_session_id = Some("provider-session".to_string());
+
+    app.input = "/rewind 1".to_string();
+    app.submit_input();
+    assert_eq!(app.session.visible_conversation_message_count(), 1);
+    assert!(
+        app.display_messages()
+            .last()
+            .expect("rewind notice")
+            .content
+            .contains("Undo anytime with `/rewind undo`")
+    );
+
+    app.input = "/rewind undo".to_string();
+    app.submit_input();
+
+    assert_eq!(app.session.visible_conversation_message_count(), 3);
+    assert_eq!(app.messages.len(), 3);
+    assert_eq!(app.provider_session_id.as_deref(), Some("provider-session"));
+    assert_eq!(
+        app.session.provider_session_id.as_deref(),
+        Some("provider-session")
+    );
+    assert!(
+        app.display_messages()
+            .last()
+            .expect("undo notice")
+            .content
+            .contains("✓ Undid rewind. Restored 2 messages.")
+    );
+}
+
+#[test]
+fn test_rewind_lists_visible_messages_when_initial_session_context_is_hidden() {
     let mut app = create_test_app();
 
-    app.replace_provider_messages(vec![
-        Message::user("provider-only user"),
-        Message::assistant_text("provider-only assistant"),
-    ]);
+    for idx in 1..=2 {
+        app.session.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("msg-{}", idx),
+                cache_control: None,
+            }],
+        );
+    }
 
     app.input = "/rewind".to_string();
     app.submit_input();
 
-    let latest = app.display_messages().last().expect("rewind output");
-    assert!(latest.content.contains("Conversation history"));
-    assert!(latest.content.contains("provider-only user"));
-    assert!(latest.content.contains("provider-only assistant"));
-    assert!(!latest.content.contains("No messages in conversation"));
-}
-
-#[test]
-fn test_rewind_truncates_provider_messages_when_session_messages_empty() {
-    let mut app = create_test_app();
-
-    app.replace_provider_messages(vec![
-        Message::user("provider-only-1"),
-        Message::assistant_text("provider-only-2"),
-        Message::user("provider-only-3"),
-    ]);
-    app.provider_session_id = Some("provider-session".to_string());
-    app.session.provider_session_id = Some("provider-session".to_string());
-
-    app.input = "/rewind 2".to_string();
-    app.submit_input();
-
-    assert_eq!(app.messages.len(), 2);
-    assert!(matches!(
-        &app.messages[1].content[0],
-        ContentBlock::Text { text, .. } if text == "provider-only-2"
-    ));
-    assert!(app.provider_session_id.is_none());
-    assert!(app.session.provider_session_id.is_none());
+    let last = app.display_messages().last().expect("history message");
+    assert!(last.content.contains("**Conversation history:**"));
+    assert!(last.content.contains("`1` 👤 User - msg-1"));
+    assert!(last.content.contains("`2` 👤 User - msg-2"));
+    assert!(!last.content.contains("Session Context"));
+    assert!(!last.content.contains("No messages in conversation"));
 }
 
 #[test]

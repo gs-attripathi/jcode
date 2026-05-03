@@ -1,9 +1,9 @@
 pub use jcode_provider_metadata::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const OPENAI_COMPAT_LOCAL_ENABLED_ENV: &str = "JCODE_OPENAI_COMPAT_LOCAL_ENABLED";
 
-fn api_base_uses_localhost(raw: &str) -> bool {
+pub(crate) fn api_base_uses_localhost(raw: &str) -> bool {
     let Ok(parsed) = url::Url::parse(raw) else {
         return false;
     };
@@ -83,8 +83,164 @@ pub fn resolve_openai_compatible_profile(
     resolved
 }
 
+pub fn resolve_openai_compatible_profile_selection(input: &str) -> Option<OpenAiCompatibleProfile> {
+    let provider = resolve_login_provider(input)?;
+    match provider.target {
+        LoginProviderTarget::OpenAiCompatible(profile) => Some(profile),
+        _ => None,
+    }
+}
+
+pub fn active_openai_compatible_display_name() -> Option<String> {
+    if let Ok(profile_name) = std::env::var("JCODE_NAMED_PROVIDER_PROFILE") {
+        let trimmed = profile_name.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Ok(namespace) = std::env::var("JCODE_OPENROUTER_CACHE_NAMESPACE") {
+        let trimmed = namespace.trim();
+        if let Some(profile) = openai_compatible_profiles()
+            .iter()
+            .copied()
+            .find(|profile| profile.id == trimmed)
+        {
+            return Some(profile.display_name.to_string());
+        }
+    }
+
+    let api_base = std::env::var("JCODE_OPENROUTER_API_BASE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| env_override("JCODE_OPENAI_COMPAT_API_BASE"));
+
+    let Some(api_base) = api_base.and_then(|value| normalize_api_base(&value)) else {
+        return None;
+    };
+
+    for profile in openai_compatible_profiles().iter().copied() {
+        if normalize_api_base(profile.api_base).as_deref() == Some(api_base.as_str()) {
+            return Some(profile.display_name.to_string());
+        }
+    }
+
+    if !api_base.contains("openrouter.ai") {
+        return Some("OpenAI-compatible".to_string());
+    }
+
+    None
+}
+
+pub fn runtime_provider_display_name(provider_name: &str) -> String {
+    if provider_name.eq_ignore_ascii_case("openrouter") {
+        active_openai_compatible_display_name().unwrap_or_else(|| "OpenRouter".to_string())
+    } else {
+        provider_name.to_string()
+    }
+}
+
+pub fn openai_compatible_profile_by_id(id: &str) -> Option<OpenAiCompatibleProfile> {
+    let normalized = id.trim().to_ascii_lowercase();
+    openai_compatible_profiles()
+        .iter()
+        .copied()
+        .find(|profile| profile.id == normalized)
+}
+
+pub fn openai_compatible_profile_id_for_api_base(api_base: &str) -> Option<&'static str> {
+    let normalized = normalize_api_base(api_base)?;
+    openai_compatible_profiles()
+        .iter()
+        .copied()
+        .find(|profile| {
+            normalize_api_base(profile.api_base).as_deref() == Some(normalized.as_str())
+        })
+        .map(|profile| profile.id)
+}
+
+pub fn openai_compatible_profile_id_for_display_name(display_name: &str) -> Option<&'static str> {
+    let normalized = display_name.trim().to_ascii_lowercase();
+    openai_compatible_profiles()
+        .iter()
+        .copied()
+        .find(|profile| {
+            profile.id == normalized
+                || profile
+                    .display_name
+                    .eq_ignore_ascii_case(display_name.trim())
+        })
+        .map(|profile| profile.id)
+}
+
+pub fn openai_compatible_profile_static_models(profile: OpenAiCompatibleProfile) -> Vec<String> {
+    let mut models = Vec::new();
+    let mut push = |model: &str| {
+        let model = model.trim();
+        if !model.is_empty() && !models.iter().any(|existing| existing == model) {
+            models.push(model.to_string());
+        }
+    };
+
+    if let Some(default_model) = profile.default_model {
+        push(default_model);
+    }
+
+    match profile.id {
+        // Issue #79: DeepSeek's live model catalog is not always available during
+        // TUI startup, but both models should still be selectable once the direct
+        // provider is configured.
+        "deepseek" => {
+            push("deepseek-v4-flash");
+            push("deepseek-v4-pro");
+        }
+        "kimi" => {
+            push("kimi-for-coding");
+        }
+        _ => {}
+    }
+
+    models
+}
+
+pub fn openai_compatible_profile_static_context_limits(
+    profile: OpenAiCompatibleProfile,
+) -> HashMap<String, usize> {
+    openai_compatible_profile_static_models(profile)
+        .into_iter()
+        .filter_map(|model| {
+            openai_compatible_profile_context_limit(profile.id, &model).map(|limit| (model, limit))
+        })
+        .collect()
+}
+
+pub fn openai_compatible_profile_context_limit(profile_id: &str, model: &str) -> Option<usize> {
+    let profile_id = profile_id.trim().to_ascii_lowercase();
+    let model = model.trim().to_ascii_lowercase();
+
+    match profile_id.as_str() {
+        // DeepSeek V4 direct API models advertise a 1M token context window. The
+        // direct profile runs through the OpenRouter/OpenAI-compatible provider
+        // implementation, whose live catalog can be unavailable during startup.
+        "deepseek" if model.starts_with("deepseek-v4-") => Some(1_000_000),
+        _ => None,
+    }
+}
+
 pub fn apply_openai_compatible_profile_env(profile: Option<OpenAiCompatibleProfile>) {
-    if std::env::var_os("JCODE_PROVIDER_PROFILE_ACTIVE").is_some() {
+    apply_openai_compatible_profile_env_impl(profile, true);
+}
+
+pub fn force_apply_openai_compatible_profile_env(profile: Option<OpenAiCompatibleProfile>) {
+    apply_openai_compatible_profile_env_impl(profile, false);
+}
+
+fn apply_openai_compatible_profile_env_impl(
+    profile: Option<OpenAiCompatibleProfile>,
+    respect_named_profile_lock: bool,
+) {
+    if respect_named_profile_lock && std::env::var_os("JCODE_PROVIDER_PROFILE_ACTIVE").is_some() {
         return;
     }
 
@@ -119,6 +275,12 @@ pub fn apply_openai_compatible_profile_env(profile: Option<OpenAiCompatibleProfi
         crate::env::set_var("JCODE_OPENROUTER_ENV_FILE", &resolved.env_file);
         crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", &resolved.id);
         crate::env::set_var("JCODE_OPENROUTER_PROVIDER_FEATURES", "0");
+        let static_models = openai_compatible_profile_static_models(profile);
+        if static_models.is_empty() {
+            crate::env::remove_var("JCODE_OPENROUTER_STATIC_MODELS");
+        } else {
+            crate::env::set_var("JCODE_OPENROUTER_STATIC_MODELS", static_models.join("\n"));
+        }
         if resolved.requires_api_key {
             crate::env::remove_var("JCODE_OPENROUTER_ALLOW_NO_AUTH");
         } else {

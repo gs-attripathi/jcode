@@ -1,6 +1,11 @@
 use crate::message::ToolCall;
 use crate::side_panel::SidePanelSnapshot;
 use crate::todo::TodoItem;
+pub use jcode_background_types::{
+    BackgroundTaskProgress, BackgroundTaskProgressEvent, BackgroundTaskProgressKind,
+    BackgroundTaskProgressSource, BackgroundTaskStatus,
+};
+pub use jcode_batch_types::{BatchProgress, BatchSubcallProgress, BatchSubcallState};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -71,41 +76,6 @@ pub struct ManualToolCompleted {
     pub duration_ms: u64,
 }
 
-/// Progress update from a running batch tool call
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BatchSubcallState {
-    Running,
-    Succeeded,
-    Failed,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchSubcallProgress {
-    pub index: usize,
-    pub tool_call: crate::message::ToolCall,
-    pub state: BatchSubcallState,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BatchProgress {
-    pub session_id: String,
-    /// Parent tool_call_id of the batch call
-    pub tool_call_id: String,
-    /// Total number of sub-calls in this batch
-    pub total: usize,
-    /// Number of sub-calls that have completed (success or error)
-    pub completed: usize,
-    /// Name of the sub-call that just completed
-    pub last_completed: Option<String>,
-    /// Sub-calls that are currently still running
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub running: Vec<ToolCall>,
-    /// Ordered per-subcall progress state for richer UI rendering
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subcalls: Vec<BatchSubcallProgress>,
-}
-
 /// Type of file operation for swarm awareness
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileOp {
@@ -140,78 +110,6 @@ pub struct FileTouch {
     pub detail: Option<String>,
 }
 
-/// Status of a background task
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum BackgroundTaskStatus {
-    Running,
-    Completed,
-    Superseded,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BackgroundTaskProgressKind {
-    Determinate,
-    Indeterminate,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BackgroundTaskProgressSource {
-    Reported,
-    ParsedOutput,
-    Heuristic,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BackgroundTaskProgress {
-    pub kind: BackgroundTaskProgressKind,
-    pub percent: Option<f32>,
-    pub message: Option<String>,
-    pub current: Option<u64>,
-    pub total: Option<u64>,
-    pub unit: Option<String>,
-    pub eta_seconds: Option<u64>,
-    pub updated_at: String,
-    pub source: BackgroundTaskProgressSource,
-}
-
-impl BackgroundTaskProgress {
-    pub fn normalize(mut self) -> Self {
-        if let (Some(current), Some(total)) = (self.current, self.total)
-            && total > 0
-            && self.percent.is_none()
-        {
-            let computed = (current as f64 / total as f64) * 100.0;
-            self.percent = Some(((computed * 100.0).round() / 100.0) as f32);
-        }
-
-        self.percent = self
-            .percent
-            .map(|percent| ((percent.clamp(0.0, 100.0) * 100.0).round()) / 100.0);
-
-        if matches!(self.kind, BackgroundTaskProgressKind::Indeterminate)
-            && (self.percent.is_some()
-                || matches!((self.current, self.total), (_, Some(total)) if total > 0))
-        {
-            self.kind = BackgroundTaskProgressKind::Determinate;
-        }
-
-        self
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct BackgroundTaskProgressEvent {
-    pub task_id: String,
-    pub tool_name: String,
-    pub display_name: Option<String>,
-    pub session_id: String,
-    pub progress: BackgroundTaskProgress,
-}
-
 /// Event sent when a background task completes
 #[derive(Debug, Clone)]
 pub struct BackgroundTaskCompleted {
@@ -239,6 +137,43 @@ pub struct LoginCompleted {
 pub struct InputShellCompleted {
     pub session_id: String,
     pub result: crate::message::InputShellResult,
+}
+
+#[derive(Clone, Debug)]
+pub enum ClipboardPasteKind {
+    Smart,
+    ImageOnly,
+    ImageUrl { fallback_text: Option<String> },
+}
+
+#[derive(Clone, Debug)]
+pub enum ClipboardPasteContent {
+    Text(String),
+    Image {
+        media_type: String,
+        base64_data: String,
+    },
+    Empty,
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ClipboardPasteCompleted {
+    pub session_id: String,
+    pub kind: ClipboardPasteKind,
+    pub content: ClipboardPasteContent,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelRefreshCompleted {
+    pub session_id: String,
+    pub result: std::result::Result<crate::provider::ModelCatalogRefreshSummary, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GitStatusCompleted {
+    pub session_id: String,
+    pub result: std::result::Result<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -324,6 +259,12 @@ pub enum BusEvent {
     LoginCompleted(LoginCompleted),
     /// Local `!cmd` shell command completed from the input line
     InputShellCompleted(InputShellCompleted),
+    /// Clipboard paste/image URL work completed off the UI thread
+    ClipboardPasteCompleted(ClipboardPasteCompleted),
+    /// Local model catalog refresh completed off the UI thread
+    ModelRefreshCompleted(ModelRefreshCompleted),
+    /// Local git status command completed off the UI thread
+    GitStatusCompleted(GitStatusCompleted),
     /// Update check status from background thread
     UpdateStatus(UpdateStatus),
     /// Interactive client update status for a specific session
@@ -347,6 +288,8 @@ pub enum BusEvent {
     ModelsUpdated,
     /// Side panel pages were updated for a session
     SidePanelUpdated(SidePanelUpdated),
+    /// Deferred Mermaid rendering completed and cached content may now be visible
+    MermaidRenderCompleted,
 }
 
 pub struct Bus {

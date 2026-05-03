@@ -27,6 +27,7 @@ impl App {
         &mut self,
         terminal: &mut DefaultTerminal,
         event_stream: &mut EventStream,
+        mut bus_receiver: Option<&mut tokio::sync::broadcast::Receiver<crate::bus::BusEvent>>,
     ) -> Result<()> {
         let eager_stream_redraw = !crate::perf::tui_policy().enable_decorative_animations;
         let mut redraw_period = crate::tui::redraw_interval(self);
@@ -103,6 +104,7 @@ impl App {
             let session_id_clone = self.provider_session_id.clone();
             let static_part = split_prompt.static_part.clone();
             let dynamic_part = split_prompt.dynamic_part.clone();
+            self.begin_kv_cache_request(&request_messages, &tools, &static_part);
 
             // Make API call non-blocking - poll it in select! so we can handle input while waiting
             let mut api_future = std::pin::pin!(provider.complete_split(
@@ -163,6 +165,16 @@ impl App {
                     _ = redraw_interval.tick() => {
                         terminal.draw(|frame| crate::tui::ui::draw(frame, self))?;
                     }
+                    bus_event = async {
+                        match bus_receiver.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => futures::future::pending::<std::result::Result<crate::bus::BusEvent, tokio::sync::broadcast::error::RecvError>>().await,
+                        }
+                    } => {
+                        if super::local::handle_bus_event(self, bus_event) {
+                            self.redraw_now(terminal)?;
+                        }
+                    }
                     // Poll API call
                     result = &mut api_future => {
                         break result?;
@@ -201,6 +213,16 @@ impl App {
                         // Poll for background compaction completion during streaming
                         self.poll_compaction_completion();
                         terminal.draw(|frame| crate::tui::ui::draw(frame, self))?;
+                    }
+                    bus_event = async {
+                        match bus_receiver.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => futures::future::pending::<std::result::Result<crate::bus::BusEvent, tokio::sync::broadcast::error::RecvError>>().await,
+                        }
+                    } => {
+                        if super::local::handle_bus_event(self, bus_event) {
+                            self.redraw_now(terminal)?;
+                        }
                     }
                     // Handle keyboard input
                     event = event_stream.next() => {
@@ -394,6 +416,7 @@ impl App {
                                     }
                                     StreamEvent::ToolUseStart { id, name } => {
                                         self.pause_streaming_tps(false);
+                                        self.clear_active_experimental_feature_notice();
                                         self.broadcast_debug(crate::tui::backend::DebugEvent::ToolStart {
                                             id: id.clone(),
                                             name: name.clone(),
@@ -435,6 +458,9 @@ impl App {
                                             tool.input = serde_json::from_str(&current_tool_input)
                                                 .unwrap_or(serde_json::Value::Null);
                                             tool.refresh_intent_from_input();
+                                            if let Some(key) = Self::experimental_feature_key_for_tool(&tool) {
+                                                self.note_experimental_feature_use(key);
+                                            }
                                             if let Some(streaming_tool) = self
                                                 .streaming_tool_calls
                                                 .iter_mut()
@@ -1009,6 +1035,7 @@ impl App {
                         }
                         // Listen for subagent/batch status updates
                         bus_event = bus_receiver.recv() => {
+                            let mut needs_redraw = false;
                             match bus_event {
                                 Ok(BusEvent::SubagentStatus(status)) => {
                                     if status.session_id == self.session.id {
@@ -1018,19 +1045,27 @@ impl App {
                                             status.status
                                         };
                                         self.subagent_status = Some(display);
+                                        needs_redraw = true;
                                     }
                                 }
                                 Ok(BusEvent::BatchProgress(progress)) => {
                                     if progress.session_id == self.session.id {
                                         self.batch_progress = Some(progress);
+                                        needs_redraw = true;
                                     }
                                 }
                                 Ok(BusEvent::SidePanelUpdated(update)) => {
                                     if update.session_id == self.session.id {
                                         self.set_side_panel_snapshot(update.snapshot);
+                                        needs_redraw = true;
                                     }
                                 }
-                                _ => {}
+                                other => {
+                                    needs_redraw |= super::local::handle_bus_event(self, other);
+                                }
+                            }
+                            if needs_redraw {
+                                self.redraw_now(terminal)?;
                             }
                         }
                         // Redraw periodically
