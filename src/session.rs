@@ -1422,12 +1422,16 @@ impl Session {
     }
 
     /// All "real" branch tips: messages with no non-system children, PLUS
-    /// the current `active_real_leaf` even if it has children. The latter
-    /// covers the post-`/rewind` case where the active leaf is now a fork
-    /// point with the dropped suffix hanging off it as a sibling — the
-    /// user thinks of that point as its own branch immediately, before
-    /// they type any new prompt. System notes / typed slash-command
-    /// records are skipped as candidates and as children.
+    /// the current `active_real_leaf` even if it has children, PLUS any
+    /// message the user explicitly marked as a fork point by anchoring a
+    /// navigation note (`/rewind`, `/checkout`) onto it. The middle case
+    /// covers the post-`/rewind` jump-back where the active leaf has the
+    /// dropped suffix hanging off it as a sibling. The third case keeps
+    /// older anchored fork points visible after the user has navigated
+    /// elsewhere — without it, a rewind anchor disappears from
+    /// `/branches` as soon as something else takes over `active_leaf_id`.
+    /// System notes / typed slash-command records are skipped as
+    /// candidates and as children.
     pub fn leaves(&self) -> Vec<&StoredMessage> {
         let real_parents: std::collections::HashSet<&str> = self
             .messages
@@ -1435,10 +1439,20 @@ impl Session {
             .filter(|m| m.display_role.is_none())
             .filter_map(|m| m.parent_id.as_deref())
             .collect();
+        let anchor_parents: std::collections::HashSet<&str> = self
+            .messages
+            .iter()
+            .filter(|m| m.display_role.is_some())
+            .filter_map(|m| m.parent_id.as_deref())
+            .collect();
         let mut tips: Vec<&StoredMessage> = self
             .messages
             .iter()
-            .filter(|m| m.display_role.is_none() && !real_parents.contains(m.id.as_str()))
+            .filter(|m| {
+                m.display_role.is_none()
+                    && (!real_parents.contains(m.id.as_str())
+                        || anchor_parents.contains(m.id.as_str()))
+            })
             .collect();
         if let Some(active) = self.active_real_leaf()
             && !tips.iter().any(|m| m.id == active.id)
